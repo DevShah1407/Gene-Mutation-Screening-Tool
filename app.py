@@ -4,8 +4,6 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import Patch
 import streamlit as st
-from io import StringIO
-
 
 st.set_page_config(
     page_title="Medulloblastoma Mutation Heatmap",
@@ -19,7 +17,6 @@ st.write(
 )
 
 uploaded_file = st.file_uploader("Upload your medulloblastoma CSV file", type=["csv"])
-
 
 def load_data(file) -> pd.DataFrame:
     """Load the uploaded CSV into a DataFrame and validate required columns."""
@@ -37,7 +34,6 @@ def load_data(file) -> pd.DataFrame:
     df = df.copy()
     df.set_index("Patient_ID", inplace=True)
     return df
-
 
 def make_clustermap(df: pd.DataFrame):
     """Create the clustered heatmap and return the matplotlib figure."""
