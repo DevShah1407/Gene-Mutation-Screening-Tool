@@ -1,6 +1,11 @@
 streamlit
-pandas 
-seaborn
-matplotlib
-scipy
+pandas
 numpy
+matplotlib
+seaborn
+requests
+pysam
+PyVCF3
+torch
+transformers
+py3Dmol
