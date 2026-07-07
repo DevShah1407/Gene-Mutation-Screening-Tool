@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -67,6 +68,8 @@ import torch.nn.functional as F
 from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from google_sheet_logger import log_user_login
+
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
 PREVIEW_ROWS = 25
@@ -110,6 +113,63 @@ def get_hf_token():
     except Exception:
         token = ""
     return token or os.environ.get("HF_TOKEN", "")
+
+
+def is_logged_in():
+    return bool(st.session_state.get("user_checkin"))
+
+
+def ensure_session_id():
+    if "session_id" not in st.session_state:
+        st.session_state["session_id"] = str(uuid.uuid4())
+    return st.session_state["session_id"]
+
+
+def ensure_login():
+    ensure_session_id()
+    if is_logged_in():
+        return True
+
+    st.title("User Check-In")
+    st.caption("Please enter your details before using CarbonVEP. This check-in is logged for usage tracking.")
+
+    with st.form("user_checkin_form", clear_on_submit=False):
+        full_name = st.text_input("Full name")
+        email = st.text_input("Email address")
+        institution = st.text_input("Institution / organization")
+        role_grade = st.text_input("Optional role or grade")
+        submitted = st.form_submit_button("Continue", type="primary")
+
+    if submitted:
+        if not full_name.strip() or not email.strip() or not institution.strip():
+            st.error("Full name, email address, and institution are required.")
+            st.stop()
+
+        user_data = {
+            "full_name": full_name.strip(),
+            "email": email.strip(),
+            "institution": institution.strip(),
+            "role_grade": role_grade.strip(),
+            "session_id": st.session_state["session_id"],
+        }
+
+        try:
+            log_user_login(
+                user_data["full_name"],
+                user_data["email"],
+                user_data["institution"],
+                user_data["role_grade"],
+                user_data["session_id"],
+                status="Login",
+            )
+        except Exception as exc:
+            st.error(f"Could not log check-in to Google Sheets: {exc}")
+            st.stop()
+
+        st.session_state["user_checkin"] = user_data
+        st.rerun()
+
+    st.stop()
 
 
 def save_uploaded_maf(uploaded_file):
@@ -631,12 +691,12 @@ class VariantEnvironmentSelect(Select):
         return 1 if chain.id in self.valid_chains else 0
 
 
-def select_structure_variant(vep_df):
+def get_structure_candidates(vep_df):
     candidates = vep_df[(vep_df["Real Mapped Target"].astype(str) != "Intergenic / Non-coding") & (vep_df["Protein_Position"].astype(str) != "N/A")].copy()
     if candidates.empty:
         raise ValueError("No coding VEP row with a Protein_Position is available for structure mapping.")
     candidates["abs_score"] = candidates["Carbon Score"].astype(float).abs()
-    return candidates.sort_values("abs_score", ascending=False).iloc[0]
+    return candidates.sort_values("abs_score", ascending=False)
 
 
 def create_variant_slice(input_cif, output_slice_cif, target_residue):
@@ -675,38 +735,55 @@ def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, 
 
 def run_structure_mapping(vep_csv):
     vep_df = pd.read_csv(vep_csv)
-    row = select_structure_variant(vep_df)
-    gene_name = str(row["Real Mapped Target"])
-    target_residue = int(row["Protein_Position"])
-    carbon_score = float(row["Carbon Score"])
-    amino_acid_mutation = str(row["Amino_Acid_Mutation"])
-    uniprot_id = get_uniprot_id(gene_name)
-    if not uniprot_id:
-        raise ValueError(f"Could not resolve UniProt ID for {gene_name}")
-    app_log(f"UniProt ID: {uniprot_id}")
-    pdb_ids = get_pdb_ids(uniprot_id)
-    app_log(f"PDB IDs: {pdb_ids}")
-    if not pdb_ids:
-        raise ValueError(f"No PDB IDs found for UniProt ID {uniprot_id}")
-    pdb_id = pdb_ids[0]
-    cif_path = Path(retrieve_pdb_mmcif(pdb_id))
-    mapped_file_path = inject_carbon_score_safely(str(cif_path.parent), cif_path.name, target_residue, carbon_score)
-    if not mapped_file_path:
-        raise ValueError(f"Could not map Carbon score to residue {target_residue} in {cif_path.name}")
-    output_slice_cif = PDB_DIR / f"{pdb_id.lower()}_variant_slice.cif"
-    create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
-    html = render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score)
-    return {
-        "gene_name": gene_name,
-        "uniprot_id": uniprot_id,
-        "pdb_id": pdb_id,
-        "target_residue": target_residue,
-        "carbon_score": carbon_score,
-        "amino_acid_mutation": amino_acid_mutation,
-        "mapped_file": mapped_file_path,
-        "slice_file": str(output_slice_cif),
-        "html": html,
-    }
+    candidates = get_structure_candidates(vep_df)
+    skipped = []
+
+    for _, row in candidates.iterrows():
+        gene_name = str(row["Real Mapped Target"])
+        target_residue = int(row["Protein_Position"])
+        carbon_score = float(row["Carbon Score"])
+        amino_acid_mutation = str(row["Amino_Acid_Mutation"])
+
+        uniprot_id = get_uniprot_id(gene_name)
+        if not uniprot_id:
+            skipped.append(f"{gene_name}: no UniProt ID")
+            app_log(f"Skipping {gene_name}: could not resolve UniProt ID.")
+            continue
+
+        app_log(f"UniProt ID for {gene_name}: {uniprot_id}")
+        pdb_ids = get_pdb_ids(uniprot_id)
+        app_log(f"PDB IDs for {uniprot_id}: {pdb_ids}")
+        if not pdb_ids:
+            skipped.append(f"{gene_name} ({uniprot_id}): no PDB IDs")
+            app_log(f"Skipping {gene_name}: no PDB IDs found for UniProt ID {uniprot_id}.")
+            continue
+
+        for pdb_id in pdb_ids:
+            cif_path = Path(retrieve_pdb_mmcif(pdb_id))
+            mapped_file_path = inject_carbon_score_safely(str(cif_path.parent), cif_path.name, target_residue, carbon_score)
+            if not mapped_file_path:
+                skipped.append(f"{gene_name} ({pdb_id}): residue {target_residue} not found")
+                continue
+
+            output_slice_cif = PDB_DIR / f"{pdb_id.lower()}_variant_slice.cif"
+            create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
+            html = render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score)
+            return {
+                "skipped": False,
+                "gene_name": gene_name,
+                "uniprot_id": uniprot_id,
+                "pdb_id": pdb_id,
+                "target_residue": target_residue,
+                "carbon_score": carbon_score,
+                "amino_acid_mutation": amino_acid_mutation,
+                "mapped_file": mapped_file_path,
+                "slice_file": str(output_slice_cif),
+                "html": html,
+            }
+
+    message = "No structure could be mapped for coding VEP rows with available residue positions."
+    app_log(message)
+    return {"skipped": True, "message": message, "skipped_details": skipped, "html": None}
 
 
 def collect_output_files():
@@ -738,6 +815,20 @@ def create_outputs_zip():
 def run_full_pipeline(uploaded_file, progress_bar, status_box):
     st.session_state["log_messages"] = []
     save_uploaded_maf(uploaded_file)
+    if st.session_state.get("user_checkin"):
+        user = st.session_state["user_checkin"]
+        try:
+            log_user_login(
+                user["full_name"],
+                user["email"],
+                user["institution"],
+                user["role_grade"],
+                user["session_id"],
+                status=f"Analysis started: {uploaded_file.name}",
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Could not log analysis submission to Google Sheets: {exc}") from exc
+
     stages = [
         "Upload complete",
         "MAF conversion",
@@ -783,6 +874,8 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box):
     return structure_result
 
 
+ensure_login()
+
 st.title("CarbonVEP")
 st.caption("One-click Streamlit interface for the original CarbonVEP_v4 notebook pipeline.")
 
@@ -825,17 +918,37 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
         preview_dataframe(VEP_CSV, "VEP preview")
 
     st.subheader("Generated Plots")
-    plot_files = sorted(RUN_DIR.glob("*.png"))
-    if plot_files:
-        for plot_path in plot_files:
-            st.image(str(plot_path), caption=plot_path.name, use_container_width=True)
+    chromosome_plots = sorted(RUN_DIR.glob("chrom_*_profile.png"))
+    cohort_plots = [
+        RUN_DIR / "1_variant_score_distribution.png",
+        RUN_DIR / "2_top_mutated_genes.png",
+        RUN_DIR / "3_mutation_spectrum.png",
+    ]
+
+    if chromosome_plots:
+        chrom_labels = {plot.name.replace("chrom_", "").replace("_profile.png", ""): plot for plot in chromosome_plots}
+        selected_chrom = st.selectbox("Chromosome profile", list(chrom_labels.keys()))
+        st.image(str(chrom_labels[selected_chrom]), caption=chrom_labels[selected_chrom].name, width=850)
+
+    visible_cohort_plots = [plot for plot in cohort_plots if plot.exists()]
+    if visible_cohort_plots:
+        with st.expander("Cohort summary plots", expanded=True):
+            for plot_path in visible_cohort_plots:
+                st.image(str(plot_path), caption=plot_path.name, width=760)
 
     structure_result = st.session_state.get("structure_result")
     if structure_result:
         st.subheader("Interactive Protein Viewer")
-        components.html(structure_result["html"], height=650, scrolling=False)
-        st.write(f"Mapped structure: `{structure_result['mapped_file']}`")
-        st.write(f"Variant slice: `{structure_result['slice_file']}`")
+        if structure_result.get("skipped"):
+            st.warning(structure_result.get("message", "Protein structure mapping was skipped."))
+            skipped_details = structure_result.get("skipped_details", [])
+            if skipped_details:
+                with st.expander("Structure mapping details"):
+                    st.write(skipped_details)
+        else:
+            components.html(structure_result["html"], height=650, scrolling=False)
+            st.write(f"Mapped structure: `{structure_result['mapped_file']}`")
+            st.write(f"Variant slice: `{structure_result['slice_file']}`")
 
     if ZIP_PATH.exists():
         st.download_button(
