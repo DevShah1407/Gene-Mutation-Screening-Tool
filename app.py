@@ -13,6 +13,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import urlretrieve
 
@@ -66,13 +67,23 @@ import streamlit.components.v1 as components
 import torch
 import torch.nn.functional as F
 from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
+from google.oauth2.service_account import Credentials
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from google_sheet_logger import log_user_login
+import gspread
 
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
 PREVIEW_ROWS = 25
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+GOOGLE_SHEETS_HEADER = [
+    "Timestamp",
+    "Full Name",
+    "Email",
+    "Institution",
+    "Role / Grade",
+    "Session ID",
+    "Status",
+]
 
 MAF_PATH = RUN_DIR / "input.maf"
 VCF_PATH = RUN_DIR / "glioma_mutations.vcf"
@@ -113,6 +124,45 @@ def get_hf_token():
     except Exception:
         token = ""
     return token or os.environ.get("HF_TOKEN", "")
+
+
+def get_google_sheet():
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Missing st.secrets['gcp_service_account'].")
+
+    credentials_info = dict(st.secrets["gcp_service_account"])
+    credentials = Credentials.from_service_account_info(credentials_info, scopes=GOOGLE_SHEETS_SCOPES)
+    client = gspread.authorize(credentials)
+
+    sheet_id = st.secrets.get("google_sheet_id", "")
+    sheet_name = st.secrets.get("google_sheet_name", "")
+    if sheet_id:
+        spreadsheet = client.open_by_key(sheet_id)
+    elif sheet_name:
+        spreadsheet = client.open(sheet_name)
+    else:
+        raise RuntimeError("Set st.secrets['google_sheet_id'] or st.secrets['google_sheet_name'].")
+
+    worksheet = spreadsheet.sheet1
+    if not worksheet.row_values(1):
+        worksheet.append_row(GOOGLE_SHEETS_HEADER, value_input_option="USER_ENTERED")
+    return worksheet
+
+
+def log_user_login(full_name, email, institution, role_grade, session_id, status="Login"):
+    worksheet = get_google_sheet()
+    worksheet.append_row(
+        [
+            datetime.now(timezone.utc).isoformat(),
+            full_name,
+            email,
+            institution,
+            role_grade,
+            session_id,
+            status,
+        ],
+        value_input_option="USER_ENTERED",
+    )
 
 
 def is_logged_in():
