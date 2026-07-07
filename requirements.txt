@@ -9,3 +9,5 @@ torch
 transformers
 py3Dmol
 biopython
+gspread
+google-auth
