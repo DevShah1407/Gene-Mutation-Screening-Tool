@@ -9,15 +9,49 @@ import csv
 import gzip
 import os
 import shutil
+import tempfile
 import time
 import zipfile
 from pathlib import Path
 from urllib.request import urlretrieve
 
-PROJECT_DIR = Path(__file__).resolve().parents[3]
-RUN_DIR = PROJECT_DIR / "work" / "carbonvep_streamlit_run"
-RUN_DIR.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(RUN_DIR / "matplotlib_cache"))
+APP_DIR = Path(__file__).resolve().parent
+
+
+def resolve_writable_run_dir():
+    """Pick a writable run directory on local machines and Streamlit Cloud."""
+    candidates = []
+    env_run_dir = os.environ.get("CARBONVEP_RUN_DIR")
+    if env_run_dir:
+        candidates.append(Path(env_run_dir))
+    candidates.extend(
+        [
+            APP_DIR / "carbonvep_run",
+            Path.cwd() / "carbonvep_run",
+            Path(tempfile.gettempdir()) / "carbonvep_run",
+        ]
+    )
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_test"
+            probe.write_text("ok")
+            probe.unlink(missing_ok=True)
+            return candidate
+        except OSError:
+            continue
+
+    raise PermissionError(
+        "CarbonVEP could not create a writable run directory. "
+        "Set CARBONVEP_RUN_DIR to a writable path."
+    )
+
+
+RUN_DIR = resolve_writable_run_dir()
+MPL_CACHE_DIR = RUN_DIR / "matplotlib_cache"
+MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -30,7 +64,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import torch
 import torch.nn.functional as F
-from Bio.PDB import MMCIFParser, MMCIFIO, PDBList, Select
+from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
