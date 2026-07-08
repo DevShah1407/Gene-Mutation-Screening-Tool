@@ -72,6 +72,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
 PREVIEW_ROWS = 25
+IMAGE_PREVIEW_WIDTH = 640
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 GOOGLE_SHEETS_HEADER = [
     "Timestamp",
@@ -97,6 +98,47 @@ ZIP_PATH = RUN_DIR / "carbonvep_outputs.zip"
 
 st.set_page_config(page_title="CarbonVEP", page_icon="DNA", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 1280px;
+    }
+    div[data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e6e8ef;
+        border-radius: 8px;
+        padding: 1rem;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+    }
+    div[data-testid="stMetricLabel"] p {
+        color: #475569;
+        font-weight: 600;
+    }
+    .carbon-card {
+        border: 1px solid #e6e8ef;
+        border-radius: 8px;
+        padding: 1rem;
+        background: #ffffff;
+        margin-bottom: 1rem;
+    }
+    .carbon-section-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin-bottom: 0.35rem;
+    }
+    .carbon-muted {
+        color: #64748b;
+        font-size: 0.92rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def app_log(message):
     st.session_state.setdefault("log_messages", []).append(str(message))
@@ -114,6 +156,32 @@ def preview_dataframe(path, label):
         st.dataframe(df.head(PREVIEW_ROWS), use_container_width=True)
         return df
     return None
+
+
+def chromosome_sort_key(chromosome):
+    value = str(chromosome).replace("chr", "").replace("CHR", "")
+    if value.isdigit():
+        return (0, int(value))
+    if value.upper() == "X":
+        return (1, 23)
+    if value.upper() == "Y":
+        return (1, 24)
+    if value.upper() in {"M", "MT"}:
+        return (1, 25)
+    return (2, value)
+
+
+def get_chromosome_options(df):
+    if df is None or "chrom" not in df.columns:
+        return []
+    values = [str(chrom) for chrom in df["chrom"].dropna().unique()]
+    return sorted(values, key=chromosome_sort_key)
+
+
+def filter_dataframe_by_chromosome(df, selected_chromosome):
+    if df is None or selected_chromosome == "All chromosomes" or "chrom" not in df.columns:
+        return df
+    return df[df["chrom"].astype(str) == str(selected_chromosome)]
 
 
 def get_hf_token():
@@ -771,25 +839,66 @@ def retrieve_pdb_mmcif(pdb_id):
     return filename
 
 
+def parse_int_residue(value):
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def inspect_structure_residue(cif_path, target_residue):
+    parser = MMCIFParser(QUIET=True)
+    structure = parser.get_structure("protein_target", str(cif_path))
+    found_residues = set()
+    found_chains = set()
+    matching_chains = []
+
+    for model in structure:
+        for chain in model:
+            found_chains.add(chain.id)
+            for residue in chain:
+                res_num = residue.id[1]
+                found_residues.add(res_num)
+                if res_num == target_residue and chain.id not in matching_chains:
+                    matching_chains.append(chain.id)
+
+    return structure, found_residues, found_chains, matching_chains
+
+
 def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_score):
     cif_path = os.path.join(cif_folder, cif_filename)
     output_filename = cif_filename.lower().replace(".cif", "_mapped.cif")
     output_path = os.path.join(cif_folder, output_filename)
+    original_target_residue = target_residue
+    target_residue = parse_int_residue(target_residue)
+    if target_residue is None:
+        app_log(f"Invalid target residue '{original_target_residue}' for {cif_filename}; skipping this structure.")
+        return None
     if not os.path.exists(cif_path):
         app_log(f"Structural file not found at: {cif_path}")
         return None
+    if os.path.getsize(cif_path) == 0:
+        app_log(f"Structural file is empty: {cif_path}")
+        return None
     try:
-        parser = MMCIFParser(QUIET=True)
-        structure = parser.get_structure("protein_target", cif_path)
+        structure, found_residues_in_file, found_chains, matching_chains = inspect_structure_residue(cif_path, target_residue)
         modified_atoms = 0
-        found_residues_in_file = set()
-        found_chains = set()
+        if not matching_chains:
+            app_log(
+                f"Residue {target_residue} was not found in '{cif_filename}'. "
+                "Skipping this PDB candidate instead of assuming VEP and PDB numbering match."
+            )
+            sorted_res = sorted(list(found_residues_in_file))
+            app_log(f"Available chains in this file: {list(found_chains)}")
+            if sorted_res:
+                app_log(f"Structural residue number range present in file: {sorted_res[0]} to {sorted_res[-1]}")
+            else:
+                app_log("No valid residues parsed from this structural layout.")
+            return None
         for model in structure:
             for chain in model:
-                found_chains.add(chain.id)
                 for residue in chain:
                     res_num = residue.id[1]
-                    found_residues_in_file.add(res_num)
                     if res_num == target_residue:
                         for atom in residue:
                             atom.set_bfactor(float(carbon_score))
@@ -801,15 +910,9 @@ def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_
             app_log(f"Success! Mapped Carbon Score ({carbon_score}) to residue {target_residue} across {modified_atoms} atoms.")
             app_log(f"Saved -> {output_path}")
             return output_path
-        app_log(f"Failed to find specific residue {target_residue} inside '{cif_filename}'.")
-        sorted_res = sorted(list(found_residues_in_file))
-        app_log(f"Available chains in this file: {list(found_chains)}")
-        if sorted_res:
-            app_log(f"Structural sequence number range present in file: {sorted_res[0]} to {sorted_res[-1]}")
-        else:
-            app_log("No valid residues parsed from this structural layout.")
+        app_log(f"Residue {target_residue} was detected but no atoms were updated in '{cif_filename}'.")
     except Exception as e:
-        app_log(f"Error parsing structural file arrays: {e}")
+        app_log(f"Error parsing or writing structural file '{cif_filename}': {e}")
     return None
 
 
@@ -824,55 +927,117 @@ class VariantEnvironmentSelect(Select):
 def get_structure_candidates(vep_df):
     candidates = vep_df[(vep_df["Real Mapped Target"].astype(str) != "Intergenic / Non-coding") & (vep_df["Protein_Position"].astype(str) != "N/A")].copy()
     if candidates.empty:
-        raise ValueError("No coding VEP row with a Protein_Position is available for structure mapping.")
-    candidates["abs_score"] = candidates["Carbon Score"].astype(float).abs()
+        return candidates
+    candidates["Carbon Score"] = pd.to_numeric(candidates["Carbon Score"], errors="coerce")
+    candidates = candidates.dropna(subset=["Carbon Score"])
+    if candidates.empty:
+        return candidates
+    candidates["abs_score"] = candidates["Carbon Score"].abs()
     return candidates.sort_values("abs_score", ascending=False)
 
 
 def create_variant_slice(input_cif, output_slice_cif, target_residue):
-    parser = MMCIFParser(QUIET=True)
-    structure = parser.get_structure("protein", input_cif)
-    target_key = (" ", int(target_residue), " ")
-    chains_to_keep = []
-    for model in structure:
-        for chain in model:
-            if chain.has_id(target_key):
-                chains_to_keep.append(chain.id)
-    app_log(f"Filtering complex down to variant-bearing chains: {chains_to_keep}")
-    io = MMCIFIO()
-    io.set_structure(structure)
-    io.save(output_slice_cif, VariantEnvironmentSelect(chains_to_keep))
-    app_log(f"Created lightweight variant slice: {output_slice_cif}")
-    return chains_to_keep
+    target_residue = parse_int_residue(target_residue)
+    if target_residue is None:
+        return {"success": False, "reason": "invalid target residue", "chains_to_keep": []}
+    if not Path(input_cif).exists():
+        return {"success": False, "reason": f"mapped mmCIF file does not exist: {input_cif}", "chains_to_keep": []}
+    if Path(input_cif).stat().st_size == 0:
+        return {"success": False, "reason": f"mapped mmCIF file is empty: {input_cif}", "chains_to_keep": []}
+
+    try:
+        structure, found_residues, found_chains, chains_to_keep = inspect_structure_residue(input_cif, target_residue)
+        if not chains_to_keep:
+            sorted_res = sorted(list(found_residues))
+            residue_summary = f"{sorted_res[0]} to {sorted_res[-1]}" if sorted_res else "none"
+            reason = (
+                f"target residue {target_residue} not present in mapped structure; "
+                f"chains={list(found_chains)}, residue_range={residue_summary}"
+            )
+            app_log(f"Cannot create variant slice: {reason}")
+            return {"success": False, "reason": reason, "chains_to_keep": []}
+
+        app_log(f"Filtering complex down to variant-bearing chains: {chains_to_keep}")
+        io = MMCIFIO()
+        io.set_structure(structure)
+        io.save(output_slice_cif, VariantEnvironmentSelect(chains_to_keep))
+        output_path = Path(output_slice_cif)
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            return {"success": False, "reason": "generated slice file is empty or missing", "chains_to_keep": chains_to_keep}
+        app_log(f"Created lightweight variant slice: {output_slice_cif}")
+        return {"success": True, "reason": "", "chains_to_keep": chains_to_keep}
+    except Exception as exc:
+        reason = f"slice creation failed: {exc}"
+        app_log(reason)
+        return {"success": False, "reason": reason, "chains_to_keep": []}
 
 
 def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score):
-    with open(output_slice_cif, "r") as f:
-        slice_data = f.read()
-    view = py3Dmol.view(width=800, height=600)
-    view.addModel(slice_data, "cif")
-    view.setStyle({}, {"cartoon": {"color": "#CECECE", "opacity": 0.8}})
-    mutation_selection = {"resi": [int(target_residue)]}
-    view.addStyle(mutation_selection, {"sphere": {"color": "#FF007F", "radius": 3.0}})
-    view.addLabel(
-        f"Mutation Site: {amino_acid_mutation}\nCarbon Score: {carbon_score}",
-        {"fontColor": "white", "backgroundColor": "#111111", "backgroundOpacity": 0.9, "fontSize": 14},
-        mutation_selection,
-    )
-    view.zoomTo(mutation_selection)
-    return view._make_html()
+    target_residue = parse_int_residue(target_residue)
+    if target_residue is None:
+        return {"success": False, "reason": "invalid target residue", "html": None}
+    slice_path = Path(output_slice_cif)
+    if not slice_path.exists():
+        return {"success": False, "reason": f"slice file does not exist: {output_slice_cif}", "html": None}
+    if slice_path.stat().st_size == 0:
+        return {"success": False, "reason": f"slice file is empty: {output_slice_cif}", "html": None}
+
+    try:
+        _, _, _, matching_chains = inspect_structure_residue(slice_path, target_residue)
+        if not matching_chains:
+            return {"success": False, "reason": f"target residue {target_residue} is absent from generated slice", "html": None}
+        with open(slice_path, "r") as f:
+            slice_data = f.read()
+        if not slice_data.strip() or "_atom_site." not in slice_data:
+            return {"success": False, "reason": "slice file does not look like a valid atom-containing mmCIF", "html": None}
+
+        view = py3Dmol.view(width=760, height=560)
+        view.addModel(slice_data, "cif")
+        view.setStyle({}, {"cartoon": {"color": "#CECECE", "opacity": 0.8}})
+        mutation_selection = {"resi": [target_residue]}
+        view.addStyle(mutation_selection, {"sphere": {"color": "#FF007F", "radius": 3.0}})
+        view.addLabel(
+            f"Mutation Site: {amino_acid_mutation}\nCarbon Score: {carbon_score}",
+            {"fontColor": "white", "backgroundColor": "#111111", "backgroundOpacity": 0.9, "fontSize": 14},
+            mutation_selection,
+        )
+        view.zoomTo(mutation_selection)
+        return {"success": True, "reason": "", "html": view._make_html()}
+    except Exception as exc:
+        reason = f"py3Dmol rendering failed: {exc}"
+        app_log(reason)
+        return {"success": False, "reason": reason, "html": None}
 
 
 def run_structure_mapping(vep_csv):
     vep_df = pd.read_csv(vep_csv)
     candidates = get_structure_candidates(vep_df)
     skipped = []
+    if candidates.empty:
+        message = "Protein structure mapping skipped: no coding VEP row with a usable Protein_Position was available."
+        app_log(message)
+        return {"skipped": True, "message": message, "skipped_details": skipped, "html": None}
 
-    for _, row in candidates.iterrows():
+    for candidate_index, row in candidates.iterrows():
         gene_name = str(row["Real Mapped Target"])
-        target_residue = int(row["Protein_Position"])
-        carbon_score = float(row["Carbon Score"])
+        target_residue = parse_int_residue(row["Protein_Position"])
+        if target_residue is None:
+            reason = f"{gene_name}: invalid Protein_Position '{row['Protein_Position']}'"
+            skipped.append(reason)
+            app_log(reason)
+            continue
+        try:
+            carbon_score = float(row["Carbon Score"])
+        except (TypeError, ValueError):
+            reason = f"{gene_name}: invalid Carbon Score '{row['Carbon Score']}'"
+            skipped.append(reason)
+            app_log(reason)
+            continue
         amino_acid_mutation = str(row["Amino_Acid_Mutation"])
+        app_log(
+            f"Structure mapping candidate VEP row {candidate_index}: "
+            f"gene={gene_name}, residue={target_residue}, mutation={amino_acid_mutation}, carbon_score={carbon_score}"
+        )
 
         uniprot_id = get_uniprot_id(gene_name)
         if not uniprot_id:
@@ -880,7 +1045,7 @@ def run_structure_mapping(vep_csv):
             app_log(f"Skipping {gene_name}: could not resolve UniProt ID.")
             continue
 
-        app_log(f"UniProt ID for {gene_name}: {uniprot_id}")
+        app_log(f"Selected gene={gene_name}; resolved UniProt ID={uniprot_id}; target residue={target_residue}")
         pdb_ids = get_pdb_ids(uniprot_id)
         app_log(f"PDB IDs for {uniprot_id}: {pdb_ids}")
         if not pdb_ids:
@@ -889,15 +1054,47 @@ def run_structure_mapping(vep_csv):
             continue
 
         for pdb_id in pdb_ids:
-            cif_path = Path(retrieve_pdb_mmcif(pdb_id))
+            app_log(
+                f"Trying PDB candidate: gene={gene_name}, UniProt={uniprot_id}, "
+                f"PDB={pdb_id}, VEP protein residue={target_residue}"
+            )
+            try:
+                cif_path = Path(retrieve_pdb_mmcif(pdb_id))
+            except Exception as exc:
+                reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): download/retrieval failed: {exc}"
+                skipped.append(reason)
+                app_log(reason)
+                continue
+
             mapped_file_path = inject_carbon_score_safely(str(cif_path.parent), cif_path.name, target_residue, carbon_score)
             if not mapped_file_path:
-                skipped.append(f"{gene_name} ({pdb_id}): residue {target_residue} not found")
+                reason = (
+                    f"{gene_name} ({uniprot_id}, PDB {pdb_id}): residue {target_residue} was not found "
+                    "using exact structural residue numbering"
+                )
+                skipped.append(reason)
+                app_log(reason)
                 continue
 
             output_slice_cif = PDB_DIR / f"{pdb_id.lower()}_variant_slice.cif"
-            create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
-            html = render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score)
+            slice_result = create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
+            if not slice_result.get("success"):
+                reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): {slice_result.get('reason', 'slice creation failed')}"
+                skipped.append(reason)
+                app_log(reason)
+                continue
+
+            render_result = render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score)
+            if not render_result.get("success"):
+                reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): {render_result.get('reason', 'rendering failed')}"
+                skipped.append(reason)
+                app_log(reason)
+                continue
+
+            app_log(
+                f"Structure mapping succeeded: gene={gene_name}, UniProt={uniprot_id}, "
+                f"PDB={pdb_id}, residue={target_residue}"
+            )
             return {
                 "skipped": False,
                 "gene_name": gene_name,
@@ -908,10 +1105,12 @@ def run_structure_mapping(vep_csv):
                 "amino_acid_mutation": amino_acid_mutation,
                 "mapped_file": mapped_file_path,
                 "slice_file": str(output_slice_cif),
-                "html": html,
+                "html": render_result["html"],
+                "chains": slice_result.get("chains_to_keep", []),
+                "skipped_details": skipped,
             }
 
-    message = "No structure could be mapped for coding VEP rows with available residue positions."
+    message = "Protein structure mapping skipped: no available PDB candidate contained and rendered the target residue."
     app_log(message)
     return {"skipped": True, "message": message, "skipped_details": skipped, "html": None}
 
@@ -1028,62 +1227,131 @@ show_log()
 
 if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
     st.header("Results Dashboard")
-    summary_cols = st.columns(4)
+    st.caption("Pipeline outputs are written to disk using the original CarbonVEP filenames and displayed here for review.")
+
+    carbon_df = pd.read_csv(CARBON_CSV) if CARBON_CSV.exists() else None
+    mapped_df = pd.read_csv(MAPPED_CSV) if MAPPED_CSV.exists() else None
+    vep_df = pd.read_csv(VEP_CSV) if VEP_CSV.exists() else None
+
+    variant_count = 0
     if VCF_PATH.exists():
         with open(VCF_PATH) as handle:
             variant_count = sum(1 for line in handle if not line.startswith("#"))
-        summary_cols[0].metric("VCF variants", variant_count)
-    if CARBON_CSV.exists():
-        carbon_df = pd.read_csv(CARBON_CSV)
-        summary_cols[1].metric("Scored variants", len(carbon_df))
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("VCF variants", variant_count)
+    summary_cols[1].metric("Scored variants", len(carbon_df) if carbon_df is not None else 0)
+    if carbon_df is not None and not carbon_df.empty:
         summary_cols[2].metric("Max Carbon score", f"{carbon_df['variant_score'].max():.4f}")
         summary_cols[3].metric("Min Carbon score", f"{carbon_df['variant_score'].min():.4f}")
+    else:
+        summary_cols[2].metric("Max Carbon score", "N/A")
+        summary_cols[3].metric("Min Carbon score", "N/A")
 
-    csv_tabs = st.tabs(["Carbon Scores", "Mapped Variants", "VEP Matrix"])
-    with csv_tabs[0]:
-        preview_dataframe(CARBON_CSV, "Carbon score preview")
-    with csv_tabs[1]:
-        preview_dataframe(MAPPED_CSV, "Mapped variant preview")
-    with csv_tabs[2]:
-        preview_dataframe(VEP_CSV, "VEP preview")
+    chromosome_options = get_chromosome_options(carbon_df)
+    selected_filter_chrom = "All chromosomes"
+    if chromosome_options:
+        with st.container():
+            st.markdown('<div class="carbon-section-title">Output Filters</div>', unsafe_allow_html=True)
+            selected_filter_chrom = st.selectbox(
+                "Filter mapped variant tables by chromosome",
+                ["All chromosomes"] + chromosome_options,
+                index=0,
+            )
 
-    st.subheader("Generated Plots")
-    chromosome_plots = sorted(RUN_DIR.glob("chrom_*_profile.png"))
+    tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads"])
+
     cohort_plots = [
         RUN_DIR / "1_variant_score_distribution.png",
         RUN_DIR / "2_top_mutated_genes.png",
         RUN_DIR / "3_mutation_spectrum.png",
     ]
-
-    if chromosome_plots:
-        chrom_labels = {plot.name.replace("chrom_", "").replace("_profile.png", ""): plot for plot in chromosome_plots}
-        selected_chrom = st.selectbox("Chromosome profile", list(chrom_labels.keys()))
-        st.image(str(chrom_labels[selected_chrom]), caption=chrom_labels[selected_chrom].name, width=850)
-
     visible_cohort_plots = [plot for plot in cohort_plots if plot.exists()]
-    if visible_cohort_plots:
-        with st.expander("Cohort summary plots", expanded=True):
-            for plot_path in visible_cohort_plots:
-                st.image(str(plot_path), caption=plot_path.name, width=760)
+    chromosome_plots = sorted(RUN_DIR.glob("chrom_*_profile.png"), key=lambda p: chromosome_sort_key(p.name.replace("chrom_", "").replace("_profile.png", "")))
 
-    structure_result = st.session_state.get("structure_result")
-    if structure_result:
-        st.subheader("Interactive Protein Viewer")
-        if structure_result.get("skipped"):
-            st.warning(structure_result.get("message", "Protein structure mapping was skipped."))
-            skipped_details = structure_result.get("skipped_details", [])
-            if skipped_details:
-                with st.expander("Structure mapping details"):
-                    st.write(skipped_details)
+    with tabs[0]:
+        st.markdown('<div class="carbon-section-title">Cohort Summary</div>', unsafe_allow_html=True)
+        if visible_cohort_plots:
+            plot_cols = st.columns(2)
+            for idx, plot_path in enumerate(visible_cohort_plots):
+                with plot_cols[idx % 2]:
+                    st.image(str(plot_path), caption=plot_path.name, use_container_width=True)
         else:
-            components.html(structure_result["html"], height=650, scrolling=False)
-            st.write(f"Mapped structure: `{structure_result['mapped_file']}`")
-            st.write(f"Variant slice: `{structure_result['slice_file']}`")
+            st.info("Cohort summary plots will appear here after the pipeline generates them.")
 
-    if ZIP_PATH.exists():
-        st.download_button(
-            "Download all CarbonVEP outputs as ZIP",
-            ZIP_PATH.read_bytes(),
-            file_name=ZIP_PATH.name,
-            mime="application/zip",
-        )
+        if carbon_df is not None:
+            st.markdown('<div class="carbon-section-title">Carbon Score Preview</div>', unsafe_allow_html=True)
+            st.dataframe(carbon_df.head(PREVIEW_ROWS), use_container_width=True)
+
+    with tabs[1]:
+        st.markdown('<div class="carbon-section-title">Chromosome Explorer</div>', unsafe_allow_html=True)
+        if chromosome_plots:
+            st.caption("Open each chromosome panel to review its positional Carbon score profile.")
+            for plot_path in chromosome_plots:
+                chrom_label = plot_path.name.replace("chrom_", "").replace("_profile.png", "")
+                with st.expander(f"Chromosome {chrom_label}", expanded=False):
+                    st.image(str(plot_path), caption=plot_path.name, width=IMAGE_PREVIEW_WIDTH)
+                    if carbon_df is not None and "chrom" in carbon_df.columns:
+                        chrom_rows = carbon_df[carbon_df["chrom"].astype(str) == chrom_label]
+                        st.dataframe(chrom_rows.head(PREVIEW_ROWS), use_container_width=True)
+        else:
+            st.info("Chromosome-specific plots will appear here after generation.")
+
+    with tabs[2]:
+        st.markdown('<div class="carbon-section-title">Mapped Carbon Variants</div>', unsafe_allow_html=True)
+        if mapped_df is not None:
+            filtered_mapped_df = filter_dataframe_by_chromosome(mapped_df, selected_filter_chrom)
+            st.caption(f"Showing {len(filtered_mapped_df)} of {len(mapped_df)} mapped variants.")
+            st.dataframe(filtered_mapped_df, use_container_width=True)
+        else:
+            st.info("Mapped variant output is not available yet.")
+
+    with tabs[3]:
+        st.markdown('<div class="carbon-section-title">VEP Mapped Output</div>', unsafe_allow_html=True)
+        if vep_df is not None:
+            st.dataframe(vep_df, use_container_width=True)
+        else:
+            st.info("VEP output is not available yet.")
+
+    with tabs[4]:
+        st.markdown('<div class="carbon-section-title">Interactive Protein Viewer</div>', unsafe_allow_html=True)
+        structure_result = st.session_state.get("structure_result")
+        if structure_result:
+            if structure_result.get("skipped"):
+                st.warning(structure_result.get("message", "Protein structure mapping was skipped."))
+                skipped_details = structure_result.get("skipped_details", [])
+                if skipped_details:
+                    with st.expander("Structure mapping candidate details", expanded=True):
+                        for detail in skipped_details:
+                            st.write(f"- {detail}")
+            else:
+                st.success(
+                    "Mapped "
+                    f"{structure_result['gene_name']} residue {structure_result['target_residue']} "
+                    f"on PDB {structure_result['pdb_id']}."
+                )
+                components.html(structure_result["html"], height=620, scrolling=False)
+                st.write(f"UniProt ID: `{structure_result['uniprot_id']}`")
+                st.write(f"Mapped structure: `{structure_result['mapped_file']}`")
+                st.write(f"Variant slice: `{structure_result['slice_file']}`")
+                if structure_result.get("chains"):
+                    st.write(f"Variant-bearing chains: `{', '.join(structure_result['chains'])}`")
+                if structure_result.get("skipped_details"):
+                    with st.expander("Earlier skipped structure candidates"):
+                        for detail in structure_result["skipped_details"]:
+                            st.write(f"- {detail}")
+        else:
+            st.info("The protein viewer will appear after a structure candidate is successfully mapped.")
+
+    with tabs[5]:
+        st.markdown('<div class="carbon-section-title">Pipeline Output Package</div>', unsafe_allow_html=True)
+        st.caption("This is a direct ZIP of the files written by the pipeline, with no schema rewriting.")
+        if ZIP_PATH.exists():
+            st.download_button(
+                "Download all CarbonVEP outputs as ZIP",
+                ZIP_PATH.read_bytes(),
+                file_name=ZIP_PATH.name,
+                mime="application/zip",
+            )
+        else:
+            st.info("The output ZIP will appear after a completed run.")
