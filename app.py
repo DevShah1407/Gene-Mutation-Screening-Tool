@@ -184,6 +184,13 @@ def filter_dataframe_by_chromosome(df, selected_chromosome):
     return df[df["chrom"].astype(str) == str(selected_chromosome)]
 
 
+def is_valid_structure_html(html):
+    if not isinstance(html, str):
+        return False
+    html = html.strip()
+    return bool(html) and ("<div" in html or "<iframe" in html or "<script" in html)
+
+
 def get_hf_token():
     try:
         token = st.secrets.get("HF_TOKEN", "")
@@ -1039,14 +1046,26 @@ def run_structure_mapping(vep_csv):
             f"gene={gene_name}, residue={target_residue}, mutation={amino_acid_mutation}, carbon_score={carbon_score}"
         )
 
-        uniprot_id = get_uniprot_id(gene_name)
+        try:
+            uniprot_id = get_uniprot_id(gene_name)
+        except Exception as exc:
+            reason = f"{gene_name}: UniProt lookup failed: {exc}"
+            skipped.append(reason)
+            app_log(reason)
+            continue
         if not uniprot_id:
             skipped.append(f"{gene_name}: no UniProt ID")
             app_log(f"Skipping {gene_name}: could not resolve UniProt ID.")
             continue
 
         app_log(f"Selected gene={gene_name}; resolved UniProt ID={uniprot_id}; target residue={target_residue}")
-        pdb_ids = get_pdb_ids(uniprot_id)
+        try:
+            pdb_ids = get_pdb_ids(uniprot_id)
+        except Exception as exc:
+            reason = f"{gene_name} ({uniprot_id}): PDB lookup failed: {exc}"
+            skipped.append(reason)
+            app_log(reason)
+            continue
         app_log(f"PDB IDs for {uniprot_id}: {pdb_ids}")
         if not pdb_ids:
             skipped.append(f"{gene_name} ({uniprot_id}): no PDB IDs")
@@ -1054,39 +1073,44 @@ def run_structure_mapping(vep_csv):
             continue
 
         for pdb_id in pdb_ids:
-            app_log(
-                f"Trying PDB candidate: gene={gene_name}, UniProt={uniprot_id}, "
-                f"PDB={pdb_id}, VEP protein residue={target_residue}"
-            )
             try:
-                cif_path = Path(retrieve_pdb_mmcif(pdb_id))
-            except Exception as exc:
-                reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): download/retrieval failed: {exc}"
-                skipped.append(reason)
-                app_log(reason)
-                continue
-
-            mapped_file_path = inject_carbon_score_safely(str(cif_path.parent), cif_path.name, target_residue, carbon_score)
-            if not mapped_file_path:
-                reason = (
-                    f"{gene_name} ({uniprot_id}, PDB {pdb_id}): residue {target_residue} was not found "
-                    "using exact structural residue numbering"
+                app_log(
+                    f"Trying PDB candidate: gene={gene_name}, UniProt={uniprot_id}, "
+                    f"PDB={pdb_id}, VEP protein residue={target_residue}"
                 )
-                skipped.append(reason)
-                app_log(reason)
-                continue
+                cif_path = Path(retrieve_pdb_mmcif(pdb_id))
 
-            output_slice_cif = PDB_DIR / f"{pdb_id.lower()}_variant_slice.cif"
-            slice_result = create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
-            if not slice_result.get("success"):
-                reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): {slice_result.get('reason', 'slice creation failed')}"
-                skipped.append(reason)
-                app_log(reason)
-                continue
+                mapped_file_path = inject_carbon_score_safely(str(cif_path.parent), cif_path.name, target_residue, carbon_score)
+                if not mapped_file_path:
+                    reason = (
+                        f"{gene_name} ({uniprot_id}, PDB {pdb_id}): residue {target_residue} was not found "
+                        "using exact structural residue numbering"
+                    )
+                    skipped.append(reason)
+                    app_log(reason)
+                    continue
 
-            render_result = render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score)
-            if not render_result.get("success"):
-                reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): {render_result.get('reason', 'rendering failed')}"
+                output_slice_cif = PDB_DIR / f"{pdb_id.lower()}_variant_slice.cif"
+                slice_result = create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
+                if not slice_result.get("success"):
+                    reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): {slice_result.get('reason', 'slice creation failed')}"
+                    skipped.append(reason)
+                    app_log(reason)
+                    continue
+
+                render_result = render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score)
+                if not isinstance(render_result, dict):
+                    reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): rendering returned no result"
+                    skipped.append(reason)
+                    app_log(reason)
+                    continue
+                if not render_result.get("success") or not is_valid_structure_html(render_result.get("html")):
+                    reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): {render_result.get('reason', 'rendering produced no valid HTML')}"
+                    skipped.append(reason)
+                    app_log(reason)
+                    continue
+            except Exception as exc:
+                reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): unexpected structure candidate failure: {exc}"
                 skipped.append(reason)
                 app_log(reason)
                 continue
@@ -1317,28 +1341,42 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
         st.markdown('<div class="carbon-section-title">Interactive Protein Viewer</div>', unsafe_allow_html=True)
         structure_result = st.session_state.get("structure_result")
         if structure_result:
-            if structure_result.get("skipped"):
-                st.warning(structure_result.get("message", "Protein structure mapping was skipped."))
-                skipped_details = structure_result.get("skipped_details", [])
+            structure_html = structure_result.get("html")
+            skipped_details = structure_result.get("skipped_details", [])
+            if structure_result.get("skipped") or not is_valid_structure_html(structure_html):
+                st.warning(
+                    structure_result.get(
+                        "message",
+                        "Protein structure mapping did not produce a renderable viewer for this run.",
+                    )
+                )
+                if not structure_result.get("skipped") and not is_valid_structure_html(structure_html):
+                    st.write("The structure candidate finished without valid viewer HTML, so the 3D viewer was not rendered.")
                 if skipped_details:
                     with st.expander("Structure mapping candidate details", expanded=True):
                         for detail in skipped_details:
                             st.write(f"- {detail}")
+                elif structure_result.get("message"):
+                    with st.expander("Structure mapping details", expanded=False):
+                        st.write(structure_result["message"])
             else:
-                st.success(
-                    "Mapped "
-                    f"{structure_result['gene_name']} residue {structure_result['target_residue']} "
-                    f"on PDB {structure_result['pdb_id']}."
-                )
-                components.html(structure_result["html"], height=620, scrolling=False)
-                st.write(f"UniProt ID: `{structure_result['uniprot_id']}`")
-                st.write(f"Mapped structure: `{structure_result['mapped_file']}`")
-                st.write(f"Variant slice: `{structure_result['slice_file']}`")
+                gene_name = structure_result.get("gene_name", "selected gene")
+                target_residue = structure_result.get("target_residue", "unknown residue")
+                pdb_id = structure_result.get("pdb_id", "selected PDB")
+                st.success(f"Mapped {gene_name} residue {target_residue} on PDB {pdb_id}.")
+                components.html(structure_html, height=620, scrolling=False)
+                if structure_result.get("uniprot_id"):
+                    st.write(f"UniProt ID: `{structure_result['uniprot_id']}`")
+                if structure_result.get("mapped_file"):
+                    st.write(f"Mapped structure: `{structure_result['mapped_file']}`")
+                if structure_result.get("slice_file"):
+                    st.write(f"Variant slice: `{structure_result['slice_file']}`")
                 if structure_result.get("chains"):
                     st.write(f"Variant-bearing chains: `{', '.join(structure_result['chains'])}`")
-                if structure_result.get("skipped_details"):
+                skipped_details = structure_result.get("skipped_details", [])
+                if skipped_details:
                     with st.expander("Earlier skipped structure candidates"):
-                        for detail in structure_result["skipped_details"]:
+                        for detail in skipped_details:
                             st.write(f"- {detail}")
         else:
             st.info("The protein viewer will appear after a structure candidate is successfully mapped.")
