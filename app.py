@@ -55,6 +55,11 @@ RUN_DIR = resolve_writable_run_dir()
 MPL_CACHE_DIR = RUN_DIR / "matplotlib_cache"
 MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
+HF_CACHE_DIR = RUN_DIR / "hf_cache"
+HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
+os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -69,6 +74,8 @@ import torch
 import torch.nn.functional as F
 from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+torch.set_num_threads(max(1, int(os.environ.get("CARBONVEP_TORCH_THREADS", "1"))))
 
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
@@ -525,19 +532,36 @@ def load_carbon_model(model_name, hf_token):
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        cache_dir=str(HF_CACHE_DIR),
+    )
+    requested_dtype = os.environ.get("CARBONVEP_MODEL_DTYPE", "bfloat16").strip().lower()
+    dtype_map = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    model_dtype = dtype_map.get(requested_dtype, torch.bfloat16)
+    model_kwargs = {
+        "trust_remote_code": True,
+        "cache_dir": str(HF_CACHE_DIR),
+        "torch_dtype": model_dtype,
+        "low_cpu_mem_usage": True,
+        "use_safetensors": True,
+    }
+    app_log(f"Loading Carbon model with dtype={model_dtype} and low-memory CPU settings.")
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            dtype=torch.float32,
-        ).to("cpu").eval()
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.float32,
-        ).to("cpu").eval()
+        model_kwargs.pop("low_cpu_mem_usage", None)
+        model_kwargs.pop("use_safetensors", None)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    model = model.to("cpu").eval()
     return tokenizer, model
 
 
