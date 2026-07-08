@@ -6,6 +6,7 @@ one MAF upload and one button execute the same disk-based pipeline.
 """
 
 import csv
+import gc
 import gzip
 import os
 import shutil
@@ -73,6 +74,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
 PREVIEW_ROWS = 25
 IMAGE_PREVIEW_WIDTH = 640
+MAX_STRUCTURE_CANDIDATES = 8
+MAX_PDB_IDS_PER_UNIPROT = 8
+MAX_CIF_BYTES_FOR_MAPPING = 20 * 1024 * 1024
+MAX_SLICE_BYTES_FOR_RENDERING = 5 * 1024 * 1024
+MAX_VIEWER_HTML_CHARS = 2_000_000
+MAX_INLINE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 GOOGLE_SHEETS_HEADER = [
     "Timestamp",
@@ -151,10 +158,23 @@ def show_log():
 
 def preview_dataframe(path, label):
     if Path(path).exists():
-        df = pd.read_csv(path)
+        df = read_csv_safely(path, label)
+        if df is None:
+            return None
         st.write(f"{label}: `{Path(path).name}` ({len(df)} rows x {len(df.columns)} columns)")
         st.dataframe(df.head(PREVIEW_ROWS), use_container_width=True)
         return df
+    return None
+
+
+def read_csv_safely(path, label):
+    try:
+        if Path(path).exists():
+            return pd.read_csv(path)
+    except Exception as exc:
+        message = f"Could not read {label} at {Path(path).name}: {exc}"
+        app_log(message)
+        st.warning(message)
     return None
 
 
@@ -188,7 +208,35 @@ def is_valid_structure_html(html):
     if not isinstance(html, str):
         return False
     html = html.strip()
-    return bool(html) and ("<div" in html or "<iframe" in html or "<script" in html)
+    if not html or len(html) > MAX_VIEWER_HTML_CHARS:
+        return False
+    return "<div" in html and ("<script" in html or "3Dmol" in html)
+
+
+def get_file_size(path):
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return None
+
+
+def format_bytes(size):
+    if size is None:
+        return "unknown size"
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def make_skipped_structure_result(message, skipped_details=None):
+    return {
+        "skipped": True,
+        "message": message,
+        "skipped_details": skipped_details or [],
+        "html": None,
+    }
 
 
 def get_hf_token():
@@ -493,6 +541,20 @@ def load_carbon_model(model_name, hf_token):
     return tokenizer, model
 
 
+def release_carbon_model_memory():
+    try:
+        load_carbon_model.clear()
+        app_log("Released cached Carbon model before late-stage annotation and structure mapping.")
+    except Exception as exc:
+        app_log(f"Carbon model cache release skipped: {exc}")
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+
+
 def evaluate_variant(variant_data, tokenizer, model):
     ref_seq = variant_data["wildtype_ctx"]
     var_seq = variant_data["mutant_ctx"]
@@ -781,14 +843,14 @@ def run_vep_mapping(input_carbon_csv, output_vep_csv):
 def get_uniprot_id(gene_name, organism_id="9606"):
     API_URL = "https://rest.uniprot.org/idmapping"
     payload = {"from": "Gene_Name", "to": "UniProtKB", "ids": gene_name, "taxId": organism_id}
-    submit_res = requests.post(f"{API_URL}/run", data=payload)
+    submit_res = requests.post(f"{API_URL}/run", data=payload, timeout=12)
     if submit_res.status_code != 200:
         return None
     job_id = submit_res.json().get("jobId")
     if not job_id:
         return None
-    while True:
-        status_res = requests.get(f"{API_URL}/status/{job_id}")
+    for _ in range(10):
+        status_res = requests.get(f"{API_URL}/status/{job_id}", timeout=12)
         if status_res.status_code == 200:
             status_data = status_res.json()
             if "results" in status_data or status_data.get("jobStatus") == "FINISHED":
@@ -796,7 +858,10 @@ def get_uniprot_id(gene_name, organism_id="9606"):
         elif status_res.history:
             break
         time.sleep(2)
-    results_res = requests.get(f"{API_URL}/results/{job_id}")
+    else:
+        app_log(f"UniProt lookup timed out for {gene_name}.")
+        return None
+    results_res = requests.get(f"{API_URL}/results/{job_id}", timeout=12)
     if results_res.status_code != 200:
         return None
     results = results_res.json()
@@ -827,7 +892,7 @@ def get_pdb_ids(uniprot_id):
         },
         "return_type": "entry",
     }
-    response = requests.post(url, json=query)
+    response = requests.post(url, json=query, timeout=15)
     if response.status_code == 200:
         results = response.json()
         return [item["identifier"] for item in results.get("result_set", [])]
@@ -854,6 +919,16 @@ def parse_int_residue(value):
 
 
 def inspect_structure_residue(cif_path, target_residue):
+    cif_size = get_file_size(cif_path)
+    if cif_size is None:
+        raise ValueError(f"structure file is not readable: {cif_path}")
+    if cif_size == 0:
+        raise ValueError(f"structure file is empty: {cif_path}")
+    if cif_size > MAX_CIF_BYTES_FOR_MAPPING:
+        raise ValueError(
+            f"structure file is too large for safe Streamlit Cloud parsing "
+            f"({format_bytes(cif_size)} > {format_bytes(MAX_CIF_BYTES_FOR_MAPPING)})"
+        )
     parser = MMCIFParser(QUIET=True)
     structure = parser.get_structure("protein_target", str(cif_path))
     found_residues = set()
@@ -884,8 +959,15 @@ def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_
     if not os.path.exists(cif_path):
         app_log(f"Structural file not found at: {cif_path}")
         return None
-    if os.path.getsize(cif_path) == 0:
+    cif_size = get_file_size(cif_path)
+    if cif_size == 0:
         app_log(f"Structural file is empty: {cif_path}")
+        return None
+    if cif_size and cif_size > MAX_CIF_BYTES_FOR_MAPPING:
+        app_log(
+            f"Structural file is too large for safe parsing in Streamlit Cloud: "
+            f"{cif_path} ({format_bytes(cif_size)})."
+        )
         return None
     try:
         structure, found_residues_in_file, found_chains, matching_chains = inspect_structure_residue(cif_path, target_residue)
@@ -969,8 +1051,18 @@ def create_variant_slice(input_cif, output_slice_cif, target_residue):
         io.set_structure(structure)
         io.save(output_slice_cif, VariantEnvironmentSelect(chains_to_keep))
         output_path = Path(output_slice_cif)
-        if not output_path.exists() or output_path.stat().st_size == 0:
+        slice_size = get_file_size(output_path)
+        if not output_path.exists() or slice_size == 0:
             return {"success": False, "reason": "generated slice file is empty or missing", "chains_to_keep": chains_to_keep}
+        if slice_size and slice_size > MAX_SLICE_BYTES_FOR_RENDERING:
+            return {
+                "success": False,
+                "reason": (
+                    "generated slice is too large for safe browser rendering "
+                    f"({format_bytes(slice_size)} > {format_bytes(MAX_SLICE_BYTES_FOR_RENDERING)})"
+                ),
+                "chains_to_keep": chains_to_keep,
+            }
         app_log(f"Created lightweight variant slice: {output_slice_cif}")
         return {"success": True, "reason": "", "chains_to_keep": chains_to_keep}
     except Exception as exc:
@@ -986,8 +1078,18 @@ def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, 
     slice_path = Path(output_slice_cif)
     if not slice_path.exists():
         return {"success": False, "reason": f"slice file does not exist: {output_slice_cif}", "html": None}
-    if slice_path.stat().st_size == 0:
+    slice_size = get_file_size(slice_path)
+    if slice_size == 0:
         return {"success": False, "reason": f"slice file is empty: {output_slice_cif}", "html": None}
+    if slice_size and slice_size > MAX_SLICE_BYTES_FOR_RENDERING:
+        return {
+            "success": False,
+            "reason": (
+                "slice file is too large for safe py3Dmol rendering "
+                f"({format_bytes(slice_size)} > {format_bytes(MAX_SLICE_BYTES_FOR_RENDERING)})"
+            ),
+            "html": None,
+        }
 
     try:
         _, _, _, matching_chains = inspect_structure_residue(slice_path, target_residue)
@@ -1009,7 +1111,10 @@ def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, 
             mutation_selection,
         )
         view.zoomTo(mutation_selection)
-        return {"success": True, "reason": "", "html": view._make_html()}
+        html = view._make_html()
+        if not is_valid_structure_html(html):
+            return {"success": False, "reason": "py3Dmol generated empty or oversized viewer HTML", "html": None}
+        return {"success": True, "reason": "", "html": html}
     except Exception as exc:
         reason = f"py3Dmol rendering failed: {exc}"
         app_log(reason)
@@ -1017,13 +1122,26 @@ def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, 
 
 
 def run_structure_mapping(vep_csv):
-    vep_df = pd.read_csv(vep_csv)
+    try:
+        vep_df = pd.read_csv(vep_csv)
+    except Exception as exc:
+        message = f"Protein structure mapping skipped: could not read VEP output ({exc})."
+        app_log(message)
+        return make_skipped_structure_result(message)
+
     candidates = get_structure_candidates(vep_df)
     skipped = []
     if candidates.empty:
         message = "Protein structure mapping skipped: no coding VEP row with a usable Protein_Position was available."
         app_log(message)
-        return {"skipped": True, "message": message, "skipped_details": skipped, "html": None}
+        return make_skipped_structure_result(message, skipped)
+
+    if len(candidates) > MAX_STRUCTURE_CANDIDATES:
+        app_log(
+            f"Limiting structure mapping to the top {MAX_STRUCTURE_CANDIDATES} coding VEP candidates "
+            f"by absolute Carbon score out of {len(candidates)} candidates."
+        )
+        candidates = candidates.head(MAX_STRUCTURE_CANDIDATES)
 
     for candidate_index, row in candidates.iterrows():
         gene_name = str(row["Real Mapped Target"])
@@ -1072,7 +1190,14 @@ def run_structure_mapping(vep_csv):
             app_log(f"Skipping {gene_name}: no PDB IDs found for UniProt ID {uniprot_id}.")
             continue
 
-        for pdb_id in pdb_ids:
+        limited_pdb_ids = pdb_ids[:MAX_PDB_IDS_PER_UNIPROT]
+        if len(pdb_ids) > len(limited_pdb_ids):
+            app_log(
+                f"Limiting PDB attempts for {gene_name} ({uniprot_id}) to the first "
+                f"{len(limited_pdb_ids)} of {len(pdb_ids)} candidates."
+            )
+
+        for pdb_id in limited_pdb_ids:
             try:
                 app_log(
                     f"Trying PDB candidate: gene={gene_name}, UniProt={uniprot_id}, "
@@ -1136,7 +1261,7 @@ def run_structure_mapping(vep_csv):
 
     message = "Protein structure mapping skipped: no available PDB candidate contained and rendered the target residue."
     app_log(message)
-    return {"skipped": True, "message": message, "skipped_details": skipped, "html": None}
+    return make_skipped_structure_result(message, skipped)
 
 
 def collect_output_files():
@@ -1154,7 +1279,16 @@ def collect_output_files():
     files = []
     for pattern in patterns:
         files.extend(RUN_DIR.glob(pattern))
-    return [p for p in files if p.exists() and p.is_file()]
+    safe_files = []
+    for path in files:
+        if not path.exists() or not path.is_file():
+            continue
+        size = get_file_size(path)
+        if path.suffix.lower() == ".cif" and size and size > MAX_CIF_BYTES_FOR_MAPPING:
+            app_log(f"Skipping oversized structure file in ZIP: {path.name} ({format_bytes(size)}).")
+            continue
+        safe_files.append(path)
+    return safe_files
 
 
 def create_outputs_zip():
@@ -1163,6 +1297,23 @@ def create_outputs_zip():
         for path in files:
             zf.write(path, arcname=str(path.relative_to(RUN_DIR)))
     return ZIP_PATH
+
+
+def run_structure_mapping_nonfatal(vep_csv):
+    try:
+        return run_structure_mapping(vep_csv)
+    except BaseException as exc:
+        message = f"Protein structure mapping skipped after a protected late-stage failure: {exc}"
+        app_log(message)
+        return make_skipped_structure_result(message, [message])
+
+
+def create_outputs_zip_nonfatal():
+    try:
+        return create_outputs_zip()
+    except Exception as exc:
+        app_log(f"Output ZIP creation skipped: {exc}")
+        return None
 
 
 def run_full_pipeline(uploaded_file, progress_bar, status_box):
@@ -1211,6 +1362,8 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box):
     dataset = extract_mutation_context(VCF_PATH, FASTA_PATH)
     update(4, "Running Carbon-500M inference")
     run_carbon_inference(dataset, CARBON_CSV)
+    dataset = None
+    release_carbon_model_memory()
     update(5, "Generating chromosome profile plots")
     generate_chromosome_plots(CARBON_CSV)
     update(6, "Mapping variants with UCSC")
@@ -1220,9 +1373,9 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box):
     update(8, "Running Ensembl VEP mapping")
     run_vep_mapping(MAPPED_CSV, VEP_CSV)
     update(9, "Mapping Carbon score into protein structure")
-    structure_result = run_structure_mapping(VEP_CSV)
+    structure_result = run_structure_mapping_nonfatal(VEP_CSV)
     update(10, "Creating output ZIP")
-    create_outputs_zip()
+    create_outputs_zip_nonfatal()
     update(11, "Complete")
     return structure_result
 
@@ -1253,14 +1406,17 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
     st.header("Results Dashboard")
     st.caption("Pipeline outputs are written to disk using the original CarbonVEP filenames and displayed here for review.")
 
-    carbon_df = pd.read_csv(CARBON_CSV) if CARBON_CSV.exists() else None
-    mapped_df = pd.read_csv(MAPPED_CSV) if MAPPED_CSV.exists() else None
-    vep_df = pd.read_csv(VEP_CSV) if VEP_CSV.exists() else None
+    carbon_df = read_csv_safely(CARBON_CSV, "Carbon scores") if CARBON_CSV.exists() else None
+    mapped_df = read_csv_safely(MAPPED_CSV, "mapped variants") if MAPPED_CSV.exists() else None
+    vep_df = read_csv_safely(VEP_CSV, "VEP output") if VEP_CSV.exists() else None
 
     variant_count = 0
     if VCF_PATH.exists():
-        with open(VCF_PATH) as handle:
-            variant_count = sum(1 for line in handle if not line.startswith("#"))
+        try:
+            with open(VCF_PATH) as handle:
+                variant_count = sum(1 for line in handle if not line.startswith("#"))
+        except Exception as exc:
+            app_log(f"Could not count VCF variants: {exc}")
 
     summary_cols = st.columns(4)
     summary_cols[0].metric("VCF variants", variant_count)
@@ -1385,11 +1541,20 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
         st.markdown('<div class="carbon-section-title">Pipeline Output Package</div>', unsafe_allow_html=True)
         st.caption("This is a direct ZIP of the files written by the pipeline, with no schema rewriting.")
         if ZIP_PATH.exists():
-            st.download_button(
-                "Download all CarbonVEP outputs as ZIP",
-                ZIP_PATH.read_bytes(),
-                file_name=ZIP_PATH.name,
-                mime="application/zip",
-            )
+            zip_size = get_file_size(ZIP_PATH)
+            st.write(f"Output package: `{ZIP_PATH.name}` ({format_bytes(zip_size)})")
+            if zip_size and zip_size > MAX_INLINE_DOWNLOAD_BYTES:
+                st.warning(
+                    "The output ZIP is too large to safely load into Streamlit's in-memory download widget. "
+                    f"The file was still written to disk at `{ZIP_PATH}`."
+                )
+            else:
+                with open(ZIP_PATH, "rb") as zip_file:
+                    st.download_button(
+                        "Download all CarbonVEP outputs as ZIP",
+                        zip_file,
+                        file_name=ZIP_PATH.name,
+                        mime="application/zip",
+                    )
         else:
             st.info("The output ZIP will appear after a completed run.")
