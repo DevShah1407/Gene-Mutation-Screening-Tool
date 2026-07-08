@@ -67,9 +67,7 @@ import streamlit.components.v1 as components
 import torch
 import torch.nn.functional as F
 from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
-from google.oauth2.service_account import Credentials
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import gspread
 
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
@@ -126,11 +124,37 @@ def get_hf_token():
     return token or os.environ.get("HF_TOKEN", "")
 
 
+def normalize_service_account_info(credentials_info):
+    credentials_info = dict(credentials_info)
+    private_key = credentials_info.get("private_key", "")
+    if private_key:
+        private_key = str(private_key).strip()
+        if (private_key.startswith('"') and private_key.endswith('"')) or (
+            private_key.startswith("'") and private_key.endswith("'")
+        ):
+            private_key = private_key[1:-1]
+        private_key = private_key.replace("\\n", "\n")
+        if not private_key.endswith("\n"):
+            private_key += "\n"
+        credentials_info["private_key"] = private_key
+    return credentials_info
+
+
 def get_google_sheet():
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Google Sheets logging dependencies are missing. Add 'gspread' and "
+            "'google-auth' to the requirements.txt file at the root of your "
+            "Streamlit Cloud GitHub repo, then redeploy."
+        ) from exc
+
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("Missing st.secrets['gcp_service_account'].")
 
-    credentials_info = dict(st.secrets["gcp_service_account"])
+    credentials_info = normalize_service_account_info(st.secrets["gcp_service_account"])
     credentials = Credentials.from_service_account_info(credentials_info, scopes=GOOGLE_SHEETS_SCOPES)
     client = gspread.authorize(credentials)
 
