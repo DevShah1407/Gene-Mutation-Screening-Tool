@@ -126,17 +126,57 @@ def get_hf_token():
 
 def normalize_service_account_info(credentials_info):
     credentials_info = dict(credentials_info)
-    private_key = credentials_info.get("private_key", "")
-    if private_key:
-        private_key = str(private_key).strip()
-        if (private_key.startswith('"') and private_key.endswith('"')) or (
-            private_key.startswith("'") and private_key.endswith("'")
-        ):
-            private_key = private_key[1:-1]
-        private_key = private_key.replace("\\n", "\n")
-        if not private_key.endswith("\n"):
-            private_key += "\n"
-        credentials_info["private_key"] = private_key
+    required_fields = [
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "auth_uri",
+        "token_uri",
+        "auth_provider_x509_cert_url",
+        "client_x509_cert_url",
+    ]
+
+    for field in required_fields:
+        if field not in credentials_info or str(credentials_info.get(field, "")).strip() == "":
+            raise RuntimeError(f"Google service account secret is missing required field: {field}")
+
+    private_key = str(credentials_info["private_key"]).strip()
+    if (private_key.startswith('"') and private_key.endswith('"')) or (
+        private_key.startswith("'") and private_key.endswith("'")
+    ):
+        private_key = private_key[1:-1].strip()
+
+    private_key = private_key.replace("\r\n", "\n").replace("\r", "\n")
+    private_key = private_key.replace("\\n", "\n")
+    private_key = private_key.strip()
+    private_key = private_key.rstrip("\n") + "\n"
+
+    key_body = private_key.strip()
+    starts_correctly = key_body.startswith("-----BEGIN PRIVATE KEY-----")
+    ends_correctly = key_body.endswith("-----END PRIVATE KEY-----")
+    literal_newlines_remain = "\\n" in private_key
+
+    st.write(
+        {
+            "private_key_starts_correctly": starts_correctly,
+            "private_key_ends_correctly": ends_correctly,
+            "private_key_first_30": private_key[:30],
+            "private_key_last_30": private_key[-30:],
+            "private_key_length": len(private_key),
+        }
+    )
+
+    if not starts_correctly:
+        raise RuntimeError("Google service account private_key must begin with -----BEGIN PRIVATE KEY-----")
+    if not ends_correctly:
+        raise RuntimeError("Google service account private_key must end with -----END PRIVATE KEY-----")
+    if literal_newlines_remain:
+        raise RuntimeError("Google service account private_key still contains literal '\\n' text after normalization.")
+
+    credentials_info["private_key"] = private_key
     return credentials_info
 
 
@@ -155,7 +195,23 @@ def get_google_sheet():
         raise RuntimeError("Missing st.secrets['gcp_service_account'].")
 
     credentials_info = normalize_service_account_info(st.secrets["gcp_service_account"])
-    credentials = Credentials.from_service_account_info(credentials_info, scopes=GOOGLE_SHEETS_SCOPES)
+    private_key = credentials_info["private_key"]
+    key_body = private_key.strip()
+    starts_correctly = key_body.startswith("-----BEGIN PRIVATE KEY-----")
+    ends_correctly = key_body.endswith("-----END PRIVATE KEY-----")
+    literal_newlines_remain = "\\n" in private_key
+
+    try:
+        credentials = Credentials.from_service_account_info(credentials_info, scopes=GOOGLE_SHEETS_SCOPES)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to create Google service account credentials. "
+            f"Original error: {exc}. "
+            f"BEGIN marker found: {starts_correctly}. "
+            f"END marker found: {ends_correctly}. "
+            f"Literal '\\n' remains: {literal_newlines_remain}. "
+            f"Private key length: {len(private_key)}."
+        ) from exc
     client = gspread.authorize(credentials)
 
     sheet_id = st.secrets.get("google_sheet_id", "")
