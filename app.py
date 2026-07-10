@@ -14,6 +14,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -70,23 +71,21 @@ import requests
 import seaborn as sns
 import streamlit as st
 import streamlit.components.v1 as components
-import torch
-import torch.nn.functional as F
 from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-torch.set_num_threads(max(1, int(os.environ.get("CARBONVEP_TORCH_THREADS", "1"))))
 
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
+CARBON_MODEL_REVISION = os.environ.get("CARBONVEP_MODEL_REVISION", "106e36ff51b5dfbfe0b078ad18ad37a6956c5714")
 PREVIEW_ROWS = 25
-IMAGE_PREVIEW_WIDTH = 640
+IMAGE_PREVIEW_WIDTH = 520
 MAX_STRUCTURE_CANDIDATES = 8
 MAX_PDB_IDS_PER_UNIPROT = 8
 MAX_CIF_BYTES_FOR_MAPPING = 20 * 1024 * 1024
 MAX_SLICE_BYTES_FOR_RENDERING = 5 * 1024 * 1024
 MAX_VIEWER_HTML_CHARS = 2_000_000
 MAX_INLINE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+VEP_REQUEST_DELAY_SECONDS = float(os.environ.get("CARBONVEP_VEP_DELAY_SECONDS", "0.1"))
+ALPHAFOLD_MODEL_VERSIONS = ("v6", "v5", "v4", "v3", "v2", "v1")
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 GOOGLE_SHEETS_HEADER = [
     "Timestamp",
@@ -115,28 +114,50 @@ st.set_page_config(page_title="CarbonVEP", page_icon="DNA", layout="wide")
 st.markdown(
     """
     <style>
+    html, body, [data-testid="stAppViewContainer"] {
+        background: #f7f9fc;
+        color: #111827;
+    }
     .block-container {
         padding-top: 2rem;
         padding-bottom: 3rem;
         max-width: 1280px;
     }
+    h1, h2, h3, h4, h5, h6, p, label, span, div {
+        color: #111827;
+    }
+    [data-testid="stSidebar"], [data-testid="stHeader"] {
+        background: #f7f9fc;
+    }
     div[data-testid="stMetric"] {
         background: #ffffff;
-        border: 1px solid #e6e8ef;
+        border: 1px solid #d7dde8;
         border-radius: 8px;
         padding: 1rem;
         box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
     }
+    div[data-testid="stMetricValue"] {
+        color: #0f172a;
+    }
     div[data-testid="stMetricLabel"] p {
-        color: #475569;
+        color: #334155;
         font-weight: 600;
     }
     .carbon-card {
-        border: 1px solid #e6e8ef;
+        border: 1px solid #d7dde8;
         border-radius: 8px;
         padding: 1rem;
         background: #ffffff;
         margin-bottom: 1rem;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+    }
+    .carbon-live-panel {
+        border: 1px solid #cbd5e1;
+        border-radius: 10px;
+        padding: 1rem;
+        background: #ffffff;
+        margin: 1rem 0;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
     }
     .carbon-section-title {
         font-size: 1.05rem;
@@ -145,8 +166,43 @@ st.markdown(
         margin-bottom: 0.35rem;
     }
     .carbon-muted {
-        color: #64748b;
+        color: #475569;
         font-size: 0.92rem;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.35rem;
+        border-bottom: 1px solid #d7dde8;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background: #eef2f7;
+        border-radius: 8px 8px 0 0;
+        color: #0f172a;
+        font-weight: 650;
+        padding: 0.65rem 1rem;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #ffffff;
+        color: #0b5cad;
+        border: 1px solid #d7dde8;
+        border-bottom-color: #ffffff;
+    }
+    div[data-testid="stExpander"] {
+        background: #ffffff;
+        border: 1px solid #d7dde8;
+        border-radius: 8px;
+    }
+    div[data-testid="stAlert"] {
+        color: #111827;
+    }
+    div[data-testid="stAlert"] * {
+        color: #111827;
+    }
+    div[data-baseweb="select"] * {
+        color: #111827;
+    }
+    .stButton > button {
+        border-radius: 8px;
+        font-weight: 700;
     }
     </style>
     """,
@@ -156,6 +212,17 @@ st.markdown(
 
 def app_log(message):
     st.session_state.setdefault("log_messages", []).append(str(message))
+
+
+@contextmanager
+def timed_stage(stage_name):
+    start = time.perf_counter()
+    app_log(f"[TIMER] {stage_name} started.")
+    try:
+        yield
+    finally:
+        duration = time.perf_counter() - start
+        app_log(f"[TIMER] {stage_name} completed in {duration:.2f}s.")
 
 
 def show_log():
@@ -169,7 +236,7 @@ def preview_dataframe(path, label):
         if df is None:
             return None
         st.write(f"{label}: `{Path(path).name}` ({len(df)} rows x {len(df.columns)} columns)")
-        st.dataframe(df.head(PREVIEW_ROWS), use_container_width=True)
+        st.dataframe(df.head(PREVIEW_ROWS), width="stretch")
         return df
     return None
 
@@ -183,6 +250,72 @@ def read_csv_safely(path, label):
         app_log(message)
         st.warning(message)
     return None
+
+
+def render_live_outputs(live_box, stage_label="", structure_result=None):
+    if live_box is None:
+        return
+
+    with live_box.container():
+        st.markdown('<div class="carbon-live-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="carbon-section-title">Live Results</div>', unsafe_allow_html=True)
+        if stage_label:
+            st.caption(f"Latest completed step: {stage_label}")
+
+        output_checks = [
+            ("VCF", VCF_PATH),
+            ("Carbon scores", CARBON_CSV),
+            ("Mapped variants", MAPPED_CSV),
+            ("VEP output", VEP_CSV),
+            ("Output ZIP", ZIP_PATH),
+        ]
+        status_cols = st.columns(len(output_checks))
+        for idx, (label, path) in enumerate(output_checks):
+            status_cols[idx].metric(label, "Ready" if path.exists() else "Pending")
+
+        if CARBON_CSV.exists():
+            carbon_preview = read_csv_safely(CARBON_CSV, "live Carbon score preview")
+            if carbon_preview is not None:
+                st.markdown('<div class="carbon-section-title">Carbon Scores Ready</div>', unsafe_allow_html=True)
+                st.dataframe(carbon_preview.head(10), width="stretch")
+
+        live_cols = st.columns(2)
+        if MAPPED_CSV.exists():
+            mapped_preview = read_csv_safely(MAPPED_CSV, "live mapped variant preview")
+            if mapped_preview is not None:
+                with live_cols[0]:
+                    st.markdown('<div class="carbon-section-title">Mapped Variants Ready</div>', unsafe_allow_html=True)
+                    st.dataframe(mapped_preview.head(8), width="stretch")
+
+        if VEP_CSV.exists():
+            vep_preview = read_csv_safely(VEP_CSV, "live VEP preview")
+            if vep_preview is not None:
+                with live_cols[1]:
+                    st.markdown('<div class="carbon-section-title">VEP Output Ready</div>', unsafe_allow_html=True)
+                    st.dataframe(vep_preview.head(8), width="stretch")
+
+        live_plots = [
+            RUN_DIR / "1_variant_score_distribution.png",
+            RUN_DIR / "2_top_mutated_genes.png",
+            RUN_DIR / "3_mutation_spectrum.png",
+        ]
+        visible_live_plots = [plot for plot in live_plots if plot.exists()]
+        if visible_live_plots:
+            st.markdown('<div class="carbon-section-title">Plots Ready</div>', unsafe_allow_html=True)
+            plot_cols = st.columns(min(3, len(visible_live_plots)))
+            for idx, plot_path in enumerate(visible_live_plots[:3]):
+                with plot_cols[idx % len(plot_cols)]:
+                    st.image(str(plot_path), caption=plot_path.name, width="stretch")
+
+        if structure_result:
+            if structure_result.get("skipped"):
+                st.warning(structure_result.get("message", "Protein structure mapping was skipped."))
+            elif is_valid_structure_html(structure_result.get("html")):
+                st.success(
+                    f"Protein viewer ready for {structure_result.get('gene_name', 'selected gene')} "
+                    f"residue {structure_result.get('target_residue', 'unknown')}."
+                )
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def chromosome_sort_key(chromosome):
@@ -288,16 +421,6 @@ def normalize_service_account_info(credentials_info):
     starts_correctly = key_body.startswith("-----BEGIN PRIVATE KEY-----")
     ends_correctly = key_body.endswith("-----END PRIVATE KEY-----")
     literal_newlines_remain = "\\n" in private_key
-
-    st.write(
-        {
-            "private_key_starts_correctly": starts_correctly,
-            "private_key_ends_correctly": ends_correctly,
-            "private_key_first_30": private_key[:30],
-            "private_key_last_30": private_key[-30:],
-            "private_key_length": len(private_key),
-        }
-    )
 
     if not starts_correctly:
         raise RuntimeError("Google service account private_key must begin with -----BEGIN PRIVATE KEY-----")
@@ -423,7 +546,8 @@ def ensure_login():
                 status="Login",
             )
         except Exception as exc:
-            st.error(f"Could not log check-in to Google Sheets: {exc}")
+            app_log(f"Google Sheets check-in failed: {exc}")
+            st.error("Could not log check-in to Google Sheets. Please verify the Streamlit secrets and sheet sharing, then try again.")
             st.stop()
 
         st.session_state["user_checkin"] = user_data
@@ -529,13 +653,20 @@ def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
 
 @st.cache_resource(show_spinner=False)
 def load_carbon_model(model_name, hf_token):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
+
+    torch.set_num_threads(max(1, int(os.environ.get("CARBONVEP_TORCH_THREADS", "1"))))
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
 
+    model_load_start = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True,
         cache_dir=str(HF_CACHE_DIR),
+        revision=CARBON_MODEL_REVISION,
+        token=hf_token or None,
     )
     requested_dtype = os.environ.get("CARBONVEP_MODEL_DTYPE", "bfloat16").strip().lower()
     dtype_map = {
@@ -550,18 +681,22 @@ def load_carbon_model(model_name, hf_token):
     model_kwargs = {
         "trust_remote_code": True,
         "cache_dir": str(HF_CACHE_DIR),
-        "torch_dtype": model_dtype,
+        "revision": CARBON_MODEL_REVISION,
+        "token": hf_token or None,
+        "dtype": model_dtype,
         "low_cpu_mem_usage": True,
         "use_safetensors": True,
     }
-    app_log(f"Loading Carbon model with dtype={model_dtype} and low-memory CPU settings.")
+    app_log(f"Loading Carbon model revision={CARBON_MODEL_REVISION} with dtype={model_dtype} and low-memory CPU settings.")
     try:
         model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     except TypeError:
+        model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
         model_kwargs.pop("low_cpu_mem_usage", None)
         model_kwargs.pop("use_safetensors", None)
         model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     model = model.to("cpu").eval()
+    app_log(f"[TIMER] Carbon model load completed in {time.perf_counter() - model_load_start:.2f}s.")
     return tokenizer, model
 
 
@@ -572,6 +707,7 @@ def release_carbon_model_memory():
     except Exception as exc:
         app_log(f"Carbon model cache release skipped: {exc}")
     try:
+        import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
@@ -580,6 +716,9 @@ def release_carbon_model_memory():
 
 
 def evaluate_variant(variant_data, tokenizer, model):
+    import torch
+    import torch.nn.functional as F
+
     ref_seq = variant_data["wildtype_ctx"]
     var_seq = variant_data["mutant_ctx"]
 
@@ -614,13 +753,14 @@ def evaluate_variant(variant_data, tokenizer, model):
     }
 
 
-def run_carbon_inference(dataset, output_csv):
+def run_carbon_inference(dataset, output_csv, progress_callback=None):
     tokenizer, model = load_carbon_model(MODEL_NAME, get_hf_token())
 
     if dataset and len(dataset) > 0:
         total_variants = len(dataset)
         app_log(f"Found {total_variants} variants in dataset. Step 1: Gathering raw scores...")
         raw_results = []
+        inference_start = time.perf_counter()
 
         for idx, variant in enumerate(dataset):
             wt_full = variant["wildtype_ctx"]
@@ -638,7 +778,11 @@ def run_carbon_inference(dataset, output_csv):
             }
             res = evaluate_variant(sliced_variant, tokenizer, model)
             raw_results.append(res)
-            app_log(f"[{idx + 1}/{total_variants}] Processed raw metrics for {res['chrom']}:{res['pos']}")
+            elapsed = max(time.perf_counter() - inference_start, 1e-9)
+            throughput = (idx + 1) / elapsed
+            app_log(f"[{idx + 1}/{total_variants}] Processed raw metrics for {res['chrom']}:{res['pos']} ({throughput:.2f} variants/s)")
+            if progress_callback and (idx == 0 or idx + 1 == total_variants or (idx + 1) % 5 == 0):
+                progress_callback(idx + 1, total_variants, res["chrom"], res["pos"], throughput)
 
         app_log("Step 2: Calculating Dataset Normalization Factors...")
         deltas = np.array([r["delta_log_prob"] for r in raw_results])
@@ -704,6 +848,7 @@ def generate_chromosome_plots(csv_path):
     app_log("All chromosome tracking plots are successfully generated and saved!")
 
 
+@st.cache_data(show_spinner=False, ttl=86400)
 def identify_gene_via_ucsc(chrom, pos):
     chrom_str = str(chrom)
     chrom_fixed = chrom_str if chrom_str.lower().startswith("chr") else f"chr{chrom_str}"
@@ -793,6 +938,7 @@ def generate_cohort_property_plots(file_path):
     app_log("All graphics successfully generated and saved as high-resolution PNGs in your directory!")
 
 
+@st.cache_data(show_spinner=False, ttl=86400)
 def query_vep_grch37(chrom, pos, ref, alt, carbon_score):
     chrom_clean = str(chrom).lower().replace("chr", "")
     url = f"https://rest.ensembl.org/vep/human/region/{chrom_clean}:{pos}-{pos}/{alt}?"
@@ -806,6 +952,8 @@ def query_vep_grch37(chrom, pos, ref, alt, carbon_score):
         "Carbon Score": carbon_score,
     }
     try:
+        if VEP_REQUEST_DELAY_SECONDS > 0:
+            time.sleep(VEP_REQUEST_DELAY_SECONDS)
         response = requests.get(url, headers=headers, timeout=12)
         if response.ok and response.json():
             results = response.json()
@@ -844,10 +992,9 @@ def query_vep_grch37(chrom, pos, ref, alt, carbon_score):
 def run_vep_mapping(input_carbon_csv, output_vep_csv):
     app_log(f"Loading raw Carbon dataset: '{input_carbon_csv}'...")
     df = pd.read_csv(input_carbon_csv)
-    app_log(f"Processing {len(df)} variants via Ensembl GRCh37 REST nodes (0.3s polite delay)...")
+    app_log(f"Processing {len(df)} variants via Ensembl GRCh37 REST nodes ({VEP_REQUEST_DELAY_SECONDS:.2f}s delay on uncached requests)...")
     mapped_rows = []
     for idx, row in df.iterrows():
-        time.sleep(0.3)
         v_score = float(row.get("Variant Score", row.get("variant_score", 0.0)))
         chrom = row.get("chrom", row.get("Chromosome"))
         pos = row.get("pos", row.get("Position"))
@@ -864,15 +1011,41 @@ def run_vep_mapping(input_carbon_csv, output_vep_csv):
     return final_df
 
 
+@st.cache_data(show_spinner=False, ttl=86400)
+def search_uniprot_accession_by_gene(gene_name, organism_id="9606"):
+    url = "https://rest.uniprot.org/uniprotkb/search"
+    params = {
+        "query": f"(gene_exact:{gene_name}) AND (organism_id:{organism_id}) AND (reviewed:true)",
+        "fields": "accession,gene_names,reviewed",
+        "format": "json",
+        "size": 1,
+    }
+    try:
+        response = requests.get(url, params=params, timeout=12)
+        if not response.ok:
+            app_log(f"UniProt search fallback failed for {gene_name}: HTTP {response.status_code}")
+            return None
+        results = response.json().get("results", [])
+        if results:
+            accession = results[0].get("primaryAccession")
+            if accession:
+                app_log(f"UniProt search fallback resolved {gene_name} -> {accession}")
+                return accession
+    except Exception as exc:
+        app_log(f"UniProt search fallback failed for {gene_name}: {exc}")
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
 def get_uniprot_id(gene_name, organism_id="9606"):
     API_URL = "https://rest.uniprot.org/idmapping"
     payload = {"from": "Gene_Name", "to": "UniProtKB", "ids": gene_name, "taxId": organism_id}
     submit_res = requests.post(f"{API_URL}/run", data=payload, timeout=12)
     if submit_res.status_code != 200:
-        return None
+        return search_uniprot_accession_by_gene(gene_name, organism_id)
     job_id = submit_res.json().get("jobId")
     if not job_id:
-        return None
+        return search_uniprot_accession_by_gene(gene_name, organism_id)
     for _ in range(10):
         status_res = requests.get(f"{API_URL}/status/{job_id}", timeout=12)
         if status_res.status_code == 200:
@@ -884,10 +1057,10 @@ def get_uniprot_id(gene_name, organism_id="9606"):
         time.sleep(2)
     else:
         app_log(f"UniProt lookup timed out for {gene_name}.")
-        return None
+        return search_uniprot_accession_by_gene(gene_name, organism_id)
     results_res = requests.get(f"{API_URL}/results/{job_id}", timeout=12)
     if results_res.status_code != 200:
-        return None
+        return search_uniprot_accession_by_gene(gene_name, organism_id)
     results = results_res.json()
     if isinstance(results, dict) and "results" in results:
         results_list = results["results"]
@@ -899,9 +1072,10 @@ def get_uniprot_id(gene_name, organism_id="9606"):
                     return to_field.get("primaryAccession")
                 elif isinstance(to_field, str):
                     return to_field
-    return None
+    return search_uniprot_accession_by_gene(gene_name, organism_id)
 
 
+@st.cache_data(show_spinner=False, ttl=86400)
 def get_pdb_ids(uniprot_id):
     url = "https://search.rcsb.org/rcsbsearch/v2/query"
     query = {
@@ -933,6 +1107,35 @@ def retrieve_pdb_mmcif(pdb_id):
     filename = pdbl.retrieve_pdb_file(pdb_id, pdir=str(PDB_DIR), file_format="mmCif")
     app_log(f"Downloaded to: {filename}")
     return filename
+
+
+def retrieve_alphafold_mmcif(uniprot_id):
+    safe_uniprot = str(uniprot_id).strip()
+    if not safe_uniprot:
+        return None
+    expected = PDB_DIR / f"af_{safe_uniprot.lower()}_model.cif"
+    if expected.exists() and get_file_size(expected):
+        app_log(f"Using local AlphaFold mmCIF: {expected}")
+        return str(expected)
+
+    for version in ALPHAFOLD_MODEL_VERSIONS:
+        url = f"https://alphafold.ebi.ac.uk/files/AF-{safe_uniprot}-F1-model_{version}.cif"
+        try:
+            app_log(f"Trying AlphaFold fallback for UniProt={safe_uniprot}: {url}")
+            response = requests.get(url, timeout=25)
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            if not response.content.strip():
+                app_log(f"AlphaFold fallback returned an empty file for {safe_uniprot} ({version}).")
+                continue
+            expected.write_bytes(response.content)
+            app_log(f"Downloaded AlphaFold mmCIF fallback to: {expected}")
+            return str(expected)
+        except Exception as exc:
+            app_log(f"AlphaFold fallback failed for {safe_uniprot} ({version}): {exc}")
+            continue
+    return None
 
 
 def parse_int_residue(value):
@@ -1145,6 +1348,79 @@ def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, 
         return {"success": False, "reason": reason, "html": None}
 
 
+def safe_structure_label(value):
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in str(value).lower()).strip("_")
+    return cleaned or "structure"
+
+
+def try_structure_candidate(
+    gene_name,
+    uniprot_id,
+    structure_id,
+    source_label,
+    cif_path,
+    target_residue,
+    carbon_score,
+    amino_acid_mutation,
+    skipped,
+):
+    app_log(
+        f"Trying structure candidate: source={source_label}, gene={gene_name}, "
+        f"UniProt={uniprot_id}, structure={structure_id}, VEP protein residue={target_residue}"
+    )
+
+    cif_path = Path(cif_path)
+    mapped_file_path = inject_carbon_score_safely(str(cif_path.parent), cif_path.name, target_residue, carbon_score)
+    if not mapped_file_path:
+        reason = (
+            f"{gene_name} ({uniprot_id}, {source_label} {structure_id}): residue {target_residue} was not found "
+            "using exact structural residue numbering"
+        )
+        skipped.append(reason)
+        app_log(reason)
+        return None
+
+    output_slice_cif = PDB_DIR / f"{safe_structure_label(structure_id)}_variant_slice.cif"
+    slice_result = create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
+    if not slice_result.get("success"):
+        reason = f"{gene_name} ({uniprot_id}, {source_label} {structure_id}): {slice_result.get('reason', 'slice creation failed')}"
+        skipped.append(reason)
+        app_log(reason)
+        return None
+
+    render_result = render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score)
+    if not isinstance(render_result, dict):
+        reason = f"{gene_name} ({uniprot_id}, {source_label} {structure_id}): rendering returned no result"
+        skipped.append(reason)
+        app_log(reason)
+        return None
+    if not render_result.get("success") or not is_valid_structure_html(render_result.get("html")):
+        reason = f"{gene_name} ({uniprot_id}, {source_label} {structure_id}): {render_result.get('reason', 'rendering produced no valid HTML')}"
+        skipped.append(reason)
+        app_log(reason)
+        return None
+
+    app_log(
+        f"Structure mapping succeeded: source={source_label}, gene={gene_name}, "
+        f"UniProt={uniprot_id}, structure={structure_id}, residue={target_residue}"
+    )
+    return {
+        "skipped": False,
+        "gene_name": gene_name,
+        "uniprot_id": uniprot_id,
+        "pdb_id": structure_id,
+        "structure_source": source_label,
+        "target_residue": target_residue,
+        "carbon_score": carbon_score,
+        "amino_acid_mutation": amino_acid_mutation,
+        "mapped_file": mapped_file_path,
+        "slice_file": str(output_slice_cif),
+        "html": render_result["html"],
+        "chains": slice_result.get("chains_to_keep", []),
+        "skipped_details": skipped,
+    }
+
+
 def run_structure_mapping(vep_csv):
     try:
         vep_df = pd.read_csv(vep_csv)
@@ -1211,8 +1487,7 @@ def run_structure_mapping(vep_csv):
         app_log(f"PDB IDs for {uniprot_id}: {pdb_ids}")
         if not pdb_ids:
             skipped.append(f"{gene_name} ({uniprot_id}): no PDB IDs")
-            app_log(f"Skipping {gene_name}: no PDB IDs found for UniProt ID {uniprot_id}.")
-            continue
+            app_log(f"No PDB IDs found for {gene_name} ({uniprot_id}); trying AlphaFold fallback.")
 
         limited_pdb_ids = pdb_ids[:MAX_PDB_IDS_PER_UNIPROT]
         if len(pdb_ids) > len(limited_pdb_ids):
@@ -1223,67 +1498,53 @@ def run_structure_mapping(vep_csv):
 
         for pdb_id in limited_pdb_ids:
             try:
-                app_log(
-                    f"Trying PDB candidate: gene={gene_name}, UniProt={uniprot_id}, "
-                    f"PDB={pdb_id}, VEP protein residue={target_residue}"
-                )
                 cif_path = Path(retrieve_pdb_mmcif(pdb_id))
-
-                mapped_file_path = inject_carbon_score_safely(str(cif_path.parent), cif_path.name, target_residue, carbon_score)
-                if not mapped_file_path:
-                    reason = (
-                        f"{gene_name} ({uniprot_id}, PDB {pdb_id}): residue {target_residue} was not found "
-                        "using exact structural residue numbering"
-                    )
-                    skipped.append(reason)
-                    app_log(reason)
-                    continue
-
-                output_slice_cif = PDB_DIR / f"{pdb_id.lower()}_variant_slice.cif"
-                slice_result = create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
-                if not slice_result.get("success"):
-                    reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): {slice_result.get('reason', 'slice creation failed')}"
-                    skipped.append(reason)
-                    app_log(reason)
-                    continue
-
-                render_result = render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score)
-                if not isinstance(render_result, dict):
-                    reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): rendering returned no result"
-                    skipped.append(reason)
-                    app_log(reason)
-                    continue
-                if not render_result.get("success") or not is_valid_structure_html(render_result.get("html")):
-                    reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): {render_result.get('reason', 'rendering produced no valid HTML')}"
-                    skipped.append(reason)
-                    app_log(reason)
-                    continue
+                result = try_structure_candidate(
+                    gene_name,
+                    uniprot_id,
+                    pdb_id,
+                    "PDB",
+                    cif_path,
+                    target_residue,
+                    carbon_score,
+                    amino_acid_mutation,
+                    skipped,
+                )
+                if result:
+                    return result
             except Exception as exc:
                 reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): unexpected structure candidate failure: {exc}"
                 skipped.append(reason)
                 app_log(reason)
                 continue
 
-            app_log(
-                f"Structure mapping succeeded: gene={gene_name}, UniProt={uniprot_id}, "
-                f"PDB={pdb_id}, residue={target_residue}"
+        try:
+            alphafold_cif = retrieve_alphafold_mmcif(uniprot_id)
+            if not alphafold_cif:
+                reason = f"{gene_name} ({uniprot_id}): no usable AlphaFold mmCIF fallback was available"
+                skipped.append(reason)
+                app_log(reason)
+                continue
+            result = try_structure_candidate(
+                gene_name,
+                uniprot_id,
+                f"AF-{uniprot_id}",
+                "AlphaFold",
+                alphafold_cif,
+                target_residue,
+                carbon_score,
+                amino_acid_mutation,
+                skipped,
             )
-            return {
-                "skipped": False,
-                "gene_name": gene_name,
-                "uniprot_id": uniprot_id,
-                "pdb_id": pdb_id,
-                "target_residue": target_residue,
-                "carbon_score": carbon_score,
-                "amino_acid_mutation": amino_acid_mutation,
-                "mapped_file": mapped_file_path,
-                "slice_file": str(output_slice_cif),
-                "html": render_result["html"],
-                "chains": slice_result.get("chains_to_keep", []),
-                "skipped_details": skipped,
-            }
+            if result:
+                return result
+        except Exception as exc:
+            reason = f"{gene_name} ({uniprot_id}, AlphaFold): unexpected fallback failure: {exc}"
+            skipped.append(reason)
+            app_log(reason)
+            continue
 
-    message = "Protein structure mapping skipped: no available PDB candidate contained and rendered the target residue."
+    message = "Protein structure mapping skipped: no available PDB or AlphaFold candidate contained and rendered the target residue."
     app_log(message)
     return make_skipped_structure_result(message, skipped)
 
@@ -1340,9 +1601,11 @@ def create_outputs_zip_nonfatal():
         return None
 
 
-def run_full_pipeline(uploaded_file, progress_bar, status_box):
+def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
+    pipeline_start = time.perf_counter()
     st.session_state["log_messages"] = []
-    save_uploaded_maf(uploaded_file)
+    with timed_stage("Upload handling"):
+        save_uploaded_maf(uploaded_file)
     if st.session_state.get("user_checkin"):
         user = st.session_state["user_checkin"]
         try:
@@ -1355,7 +1618,11 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box):
                 status=f"Analysis started: {uploaded_file.name}",
             )
         except Exception as exc:
-            raise RuntimeError(f"Could not log analysis submission to Google Sheets: {exc}") from exc
+            app_log(f"Google Sheets analysis logging failed: {exc}")
+            raise RuntimeError(
+                "Could not log this analysis submission to Google Sheets. "
+                "Please verify the Streamlit secrets and sheet sharing, then try again."
+            ) from exc
 
     stages = [
         "Upload complete",
@@ -1378,29 +1645,58 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box):
         app_log(message)
 
     update(0, "Upload complete")
+    render_live_outputs(live_box, "Upload complete")
     update(1, "Converting MAF to VCF")
-    convert_maf_to_vcf(MAF_PATH, VCF_PATH)
+    with timed_stage("MAF to VCF conversion"):
+        convert_maf_to_vcf(MAF_PATH, VCF_PATH)
+    render_live_outputs(live_box, "glioma_mutations.vcf ready")
     update(2, "Preparing hg38 reference genome")
-    download_and_prepare_hg38()
+    with timed_stage("Genome download/decompression/indexing"):
+        download_and_prepare_hg38()
+    render_live_outputs(live_box, "Reference genome ready")
     update(3, "Extracting mutation contexts")
-    dataset = extract_mutation_context(VCF_PATH, FASTA_PATH)
+    with timed_stage("Context extraction"):
+        dataset = extract_mutation_context(VCF_PATH, FASTA_PATH)
+    render_live_outputs(live_box, "Mutation contexts extracted")
     update(4, "Running Carbon-500M inference")
-    run_carbon_inference(dataset, CARBON_CSV)
+
+    def inference_progress(done, total, chrom, pos, throughput):
+        stage_fraction = (4 + min(done / max(total, 1), 1.0) * 0.85) / (len(stages) - 1)
+        message = f"Running Carbon-500M inference: {done}/{total} variants ({chrom}:{pos}, {throughput:.2f} variants/s)"
+        progress_bar.progress(stage_fraction, text=message)
+        status_box.write(message)
+
+    with timed_stage("Carbon inference"):
+        run_carbon_inference(dataset, CARBON_CSV, progress_callback=inference_progress)
     dataset = None
     release_carbon_model_memory()
+    render_live_outputs(live_box, "carbon_variant_scores.csv ready")
     update(5, "Generating chromosome profile plots")
-    generate_chromosome_plots(CARBON_CSV)
+    with timed_stage("Chromosome plot generation"):
+        generate_chromosome_plots(CARBON_CSV)
+    render_live_outputs(live_box, "Chromosome plots ready")
     update(6, "Mapping variants with UCSC")
-    map_carbon_variants_with_ucsc(CARBON_CSV, MAPPED_CSV)
+    with timed_stage("UCSC annotation"):
+        map_carbon_variants_with_ucsc(CARBON_CSV, MAPPED_CSV)
+    render_live_outputs(live_box, "mapped_carbon_variants.csv ready")
     update(7, "Generating cohort summary plots")
-    generate_cohort_property_plots(MAPPED_CSV)
+    with timed_stage("Cohort plot generation"):
+        generate_cohort_property_plots(MAPPED_CSV)
+    render_live_outputs(live_box, "Cohort plots ready")
     update(8, "Running Ensembl VEP mapping")
-    run_vep_mapping(MAPPED_CSV, VEP_CSV)
+    with timed_stage("VEP mapping"):
+        run_vep_mapping(MAPPED_CSV, VEP_CSV)
+    render_live_outputs(live_box, "vep_mapped_output.csv ready")
     update(9, "Mapping Carbon score into protein structure")
-    structure_result = run_structure_mapping_nonfatal(VEP_CSV)
+    with timed_stage("Structure mapping"):
+        structure_result = run_structure_mapping_nonfatal(VEP_CSV)
+    render_live_outputs(live_box, "Protein structure step complete", structure_result=structure_result)
     update(10, "Creating output ZIP")
-    create_outputs_zip_nonfatal()
+    with timed_stage("ZIP creation"):
+        create_outputs_zip_nonfatal()
+    render_live_outputs(live_box, "Output package ready", structure_result=structure_result)
     update(11, "Complete")
+    app_log(f"[TIMER] Full pipeline completed in {time.perf_counter() - pipeline_start:.2f}s.")
     return structure_result
 
 
@@ -1415,9 +1711,10 @@ run_clicked = st.button("Start CarbonVEP Analysis", type="primary", disabled=upl
 if run_clicked and uploaded_maf is not None:
     progress_bar = st.progress(0, text="Starting")
     status_box = st.empty()
+    live_results_box = st.empty()
     try:
         with st.spinner("Running full CarbonVEP pipeline..."):
-            structure_result = run_full_pipeline(uploaded_maf, progress_bar, status_box)
+            structure_result = run_full_pipeline(uploaded_maf, progress_bar, status_box, live_results_box)
         st.session_state["structure_result"] = structure_result
         st.success("CarbonVEP analysis complete.")
     except Exception as exc:
@@ -1479,13 +1776,13 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
             plot_cols = st.columns(2)
             for idx, plot_path in enumerate(visible_cohort_plots):
                 with plot_cols[idx % 2]:
-                    st.image(str(plot_path), caption=plot_path.name, use_container_width=True)
+                    st.image(str(plot_path), caption=plot_path.name, width=IMAGE_PREVIEW_WIDTH)
         else:
             st.info("Cohort summary plots will appear here after the pipeline generates them.")
 
         if carbon_df is not None:
             st.markdown('<div class="carbon-section-title">Carbon Score Preview</div>', unsafe_allow_html=True)
-            st.dataframe(carbon_df.head(PREVIEW_ROWS), use_container_width=True)
+            st.dataframe(carbon_df.head(PREVIEW_ROWS), width="stretch")
 
     with tabs[1]:
         st.markdown('<div class="carbon-section-title">Chromosome Explorer</div>', unsafe_allow_html=True)
@@ -1497,7 +1794,7 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
                     st.image(str(plot_path), caption=plot_path.name, width=IMAGE_PREVIEW_WIDTH)
                     if carbon_df is not None and "chrom" in carbon_df.columns:
                         chrom_rows = carbon_df[carbon_df["chrom"].astype(str) == chrom_label]
-                        st.dataframe(chrom_rows.head(PREVIEW_ROWS), use_container_width=True)
+                        st.dataframe(chrom_rows.head(PREVIEW_ROWS), width="stretch")
         else:
             st.info("Chromosome-specific plots will appear here after generation.")
 
@@ -1506,14 +1803,14 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
         if mapped_df is not None:
             filtered_mapped_df = filter_dataframe_by_chromosome(mapped_df, selected_filter_chrom)
             st.caption(f"Showing {len(filtered_mapped_df)} of {len(mapped_df)} mapped variants.")
-            st.dataframe(filtered_mapped_df, use_container_width=True)
+            st.dataframe(filtered_mapped_df, width="stretch")
         else:
             st.info("Mapped variant output is not available yet.")
 
     with tabs[3]:
         st.markdown('<div class="carbon-section-title">VEP Mapped Output</div>', unsafe_allow_html=True)
         if vep_df is not None:
-            st.dataframe(vep_df, use_container_width=True)
+            st.dataframe(vep_df, width="stretch")
         else:
             st.info("VEP output is not available yet.")
 
@@ -1542,11 +1839,14 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
             else:
                 gene_name = structure_result.get("gene_name", "selected gene")
                 target_residue = structure_result.get("target_residue", "unknown residue")
-                pdb_id = structure_result.get("pdb_id", "selected PDB")
-                st.success(f"Mapped {gene_name} residue {target_residue} on PDB {pdb_id}.")
+                structure_id = structure_result.get("pdb_id", "selected structure")
+                structure_source = structure_result.get("structure_source", "Structure")
+                st.success(f"Mapped {gene_name} residue {target_residue} on {structure_source} {structure_id}.")
                 components.html(structure_html, height=620, scrolling=False)
                 if structure_result.get("uniprot_id"):
                     st.write(f"UniProt ID: `{structure_result['uniprot_id']}`")
+                if structure_result.get("structure_source") or structure_result.get("pdb_id"):
+                    st.write(f"Structure source: `{structure_source} {structure_id}`")
                 if structure_result.get("mapped_file"):
                     st.write(f"Mapped structure: `{structure_result['mapped_file']}`")
                 if structure_result.get("slice_file"):
