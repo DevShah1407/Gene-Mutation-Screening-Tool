@@ -114,95 +114,240 @@ st.set_page_config(page_title="CarbonVEP", page_icon="DNA", layout="wide")
 st.markdown(
     """
     <style>
+    :root {
+        --carbon-bg: #f6f8fb;
+        --carbon-surface: #ffffff;
+        --carbon-surface-soft: #f9fbfd;
+        --carbon-border: #d9e1ec;
+        --carbon-border-strong: #c5d0df;
+        --carbon-text: #111827;
+        --carbon-muted: #475569;
+        --carbon-heading: #0f172a;
+        --carbon-accent: #2563eb;
+        --carbon-accent-dark: #1e40af;
+        --carbon-accent-soft: #eff6ff;
+        --carbon-good-bg: #ecfdf5;
+        --carbon-good-text: #065f46;
+        --carbon-warn-bg: #fffbeb;
+        --carbon-warn-text: #92400e;
+        --carbon-error-bg: #fef2f2;
+        --carbon-error-text: #991b1b;
+    }
     html, body, [data-testid="stAppViewContainer"] {
-        background: #f7f9fc;
-        color: #111827;
+        background: var(--carbon-bg);
+        color: var(--carbon-text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     .block-container {
-        padding-top: 2rem;
-        padding-bottom: 3rem;
+        padding-top: 1.6rem;
+        padding-bottom: 3.2rem;
         max-width: 1280px;
     }
-    h1, h2, h3, h4, h5, h6, p, label, span, div {
-        color: #111827;
+    h1 {
+        color: var(--carbon-heading);
+        font-size: clamp(2rem, 4vw, 3rem);
+        font-weight: 800;
+        letter-spacing: 0;
+        margin-bottom: 0.15rem;
+    }
+    h2, h3 {
+        color: var(--carbon-heading);
+        letter-spacing: 0;
+    }
+    p, label, span, div {
+        color: var(--carbon-text);
+    }
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stCaptionContainer"],
+    .stCaptionContainer {
+        color: var(--carbon-muted);
+        line-height: 1.55;
+    }
+    label,
+    [data-testid="stWidgetLabel"] p {
+        color: var(--carbon-heading);
+        font-weight: 650;
     }
     [data-testid="stSidebar"], [data-testid="stHeader"] {
-        background: #f7f9fc;
+        background: var(--carbon-bg);
+    }
+    section[data-testid="stSidebar"] {
+        border-right: 1px solid var(--carbon-border);
     }
     div[data-testid="stMetric"] {
-        background: #ffffff;
-        border: 1px solid #d7dde8;
-        border-radius: 8px;
-        padding: 1rem;
-        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+        background: linear-gradient(180deg, #ffffff 0%, #f9fbff 100%);
+        border: 1px solid var(--carbon-border);
+        border-radius: 12px;
+        padding: 1rem 1.05rem;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
     }
     div[data-testid="stMetricValue"] {
-        color: #0f172a;
+        color: var(--carbon-heading);
+        font-weight: 800;
     }
     div[data-testid="stMetricLabel"] p {
-        color: #334155;
+        color: var(--carbon-muted);
         font-weight: 600;
+        font-size: 0.9rem;
     }
     .carbon-card {
-        border: 1px solid #d7dde8;
-        border-radius: 8px;
-        padding: 1rem;
-        background: #ffffff;
+        border: 1px solid var(--carbon-border);
+        border-radius: 12px;
+        padding: 1.05rem;
+        background: var(--carbon-surface);
         margin-bottom: 1rem;
-        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05);
     }
     .carbon-live-panel {
-        border: 1px solid #cbd5e1;
-        border-radius: 10px;
-        padding: 1rem;
-        background: #ffffff;
-        margin: 1rem 0;
-        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+        border: 1px solid var(--carbon-border);
+        border-radius: 14px;
+        padding: 1.1rem;
+        background: var(--carbon-surface);
+        margin: 1.1rem 0;
+        box-shadow: 0 10px 28px rgba(15, 23, 42, 0.07);
     }
     .carbon-section-title {
-        font-size: 1.05rem;
+        font-size: 1.08rem;
         font-weight: 700;
-        color: #0f172a;
-        margin-bottom: 0.35rem;
+        color: var(--carbon-heading);
+        margin: 1rem 0 0.45rem;
+        letter-spacing: 0;
     }
     .carbon-muted {
-        color: #475569;
+        color: var(--carbon-muted);
         font-size: 0.92rem;
     }
     .stTabs [data-baseweb="tab-list"] {
-        gap: 0.35rem;
-        border-bottom: 1px solid #d7dde8;
+        gap: 0.3rem;
+        border-bottom: 1px solid var(--carbon-border);
+        padding-top: 0.35rem;
     }
     .stTabs [data-baseweb="tab"] {
-        background: #eef2f7;
-        border-radius: 8px 8px 0 0;
-        color: #0f172a;
+        background: #eef3f9;
+        border: 1px solid transparent;
+        border-radius: 10px 10px 0 0;
+        color: var(--carbon-heading);
         font-weight: 650;
         padding: 0.65rem 1rem;
+        min-height: 2.75rem;
+    }
+    .stTabs [data-baseweb="tab"] p {
+        color: var(--carbon-heading);
     }
     .stTabs [aria-selected="true"] {
-        background: #ffffff;
-        color: #0b5cad;
-        border: 1px solid #d7dde8;
-        border-bottom-color: #ffffff;
+        background: var(--carbon-surface);
+        color: var(--carbon-accent-dark);
+        border: 1px solid var(--carbon-border);
+        border-bottom-color: var(--carbon-surface);
+    }
+    .stTabs [aria-selected="true"] p {
+        color: var(--carbon-accent-dark);
     }
     div[data-testid="stExpander"] {
-        background: #ffffff;
-        border: 1px solid #d7dde8;
-        border-radius: 8px;
+        background: var(--carbon-surface);
+        border: 1px solid var(--carbon-border);
+        border-radius: 12px;
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
+        overflow: hidden;
+    }
+    div[data-testid="stExpander"] details summary p {
+        color: var(--carbon-heading);
+        font-weight: 650;
     }
     div[data-testid="stAlert"] {
-        color: #111827;
+        border-radius: 10px;
+        border: 1px solid var(--carbon-border);
+        color: var(--carbon-text);
     }
     div[data-testid="stAlert"] * {
-        color: #111827;
+        color: var(--carbon-text);
+    }
+    div[data-testid="stAlert"][kind="success"],
+    div[data-testid="stAlert"][data-baseweb="notification"][kind="success"] {
+        background: var(--carbon-good-bg);
+    }
+    div[data-testid="stAlert"][kind="warning"],
+    div[data-testid="stAlert"][data-baseweb="notification"][kind="warning"] {
+        background: var(--carbon-warn-bg);
+    }
+    div[data-testid="stAlert"][kind="error"],
+    div[data-testid="stAlert"][data-baseweb="notification"][kind="error"] {
+        background: var(--carbon-error-bg);
+    }
+    div[data-testid="stDataFrame"],
+    div[data-testid="stTable"] {
+        border: 1px solid var(--carbon-border);
+        border-radius: 12px;
+        overflow: hidden;
+        background: var(--carbon-surface);
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+    }
+    div[data-testid="stDataFrame"] * {
+        color: var(--carbon-text);
+    }
+    div[data-testid="stFileUploader"] {
+        background: var(--carbon-surface);
+        border: 1px solid var(--carbon-border);
+        border-radius: 12px;
+        padding: 0.8rem;
+    }
+    div[data-testid="stFileUploader"] section {
+        background: var(--carbon-surface-soft);
+        border-color: var(--carbon-border-strong);
+        border-radius: 10px;
+    }
+    div[data-testid="stFileUploader"] * {
+        color: var(--carbon-text);
+    }
+    div[data-testid="stSelectbox"] > div,
+    div[data-baseweb="select"] > div,
+    input,
+    textarea {
+        background: var(--carbon-surface);
+        color: var(--carbon-text);
+        border-color: var(--carbon-border);
     }
     div[data-baseweb="select"] * {
-        color: #111827;
+        color: var(--carbon-text);
     }
     .stButton > button {
-        border-radius: 8px;
+        border-radius: 10px;
         font-weight: 700;
+        border: 1px solid var(--carbon-border-strong);
+        box-shadow: 0 3px 10px rgba(15, 23, 42, 0.08);
+    }
+    .stButton > button[kind="primary"],
+    .stButton > button[data-testid="baseButton-primary"] {
+        background: var(--carbon-accent);
+        border-color: var(--carbon-accent);
+        color: #ffffff;
+    }
+    .stButton > button[kind="primary"] *,
+    .stButton > button[data-testid="baseButton-primary"] * {
+        color: #ffffff;
+    }
+    .stDownloadButton > button {
+        border-radius: 10px;
+        border: 1px solid var(--carbon-border-strong);
+        font-weight: 700;
+    }
+    div[data-testid="stProgress"] div {
+        color: var(--carbon-heading);
+    }
+    div[data-testid="stImage"] img {
+        border-radius: 10px;
+        border: 1px solid var(--carbon-border);
+        background: var(--carbon-surface);
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.05);
+    }
+    code {
+        color: #1e3a8a;
+        background: #eff6ff;
+        border-radius: 6px;
+        padding: 0.1rem 0.25rem;
+    }
+    hr {
+        border-color: var(--carbon-border);
     }
     </style>
     """,
@@ -813,7 +958,19 @@ def run_carbon_inference(dataset, output_csv, progress_callback=None):
 
 def generate_chromosome_plots(csv_path):
     df = pd.read_csv(csv_path)
-    sns.set_theme(style="whitegrid")
+    sns.set_theme(
+        style="whitegrid",
+        rc={
+            "axes.facecolor": "#ffffff",
+            "figure.facecolor": "#ffffff",
+            "axes.edgecolor": "#d9e1ec",
+            "grid.color": "#e5eaf2",
+            "text.color": "#111827",
+            "axes.labelcolor": "#111827",
+            "xtick.color": "#475569",
+            "ytick.color": "#475569",
+        },
+    )
     unique_chromosomes = df["chrom"].unique()
     app_log(f"Found data for chromosomes: {unique_chromosomes}")
 
@@ -825,20 +982,26 @@ def generate_chromosome_plots(csv_path):
             continue
 
         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-        ax1.plot(chrom_df["pos"], chrom_df["variant_score"], color="purple", marker="o", linestyle="-", linewidth=1.5, alpha=0.8)
-        ax1.fill_between(chrom_df["pos"], chrom_df["variant_score"], color="purple", alpha=0.1)
+        fig.patch.set_facecolor("#ffffff")
+        ax1.plot(chrom_df["pos"], chrom_df["variant_score"], color="#2563eb", marker="o", linestyle="-", linewidth=1.7, alpha=0.9)
+        ax1.fill_between(chrom_df["pos"], chrom_df["variant_score"], color="#2563eb", alpha=0.10)
         ax1.set_ylabel("Unified Variant Score", fontsize=11, fontweight="bold")
         ax1.set_title(f"Genomic Landscape Profile: {chrom}", fontsize=14, fontweight="bold", pad=15)
-        ax2.plot(chrom_df["pos"], chrom_df["delta_log_prob"], color="teal", marker="s", linestyle="-", linewidth=1.5, alpha=0.8)
-        ax2.fill_between(chrom_df["pos"], chrom_df["delta_log_prob"], color="teal", alpha=0.1)
+        ax2.plot(chrom_df["pos"], chrom_df["delta_log_prob"], color="#0f766e", marker="s", linestyle="-", linewidth=1.7, alpha=0.9)
+        ax2.fill_between(chrom_df["pos"], chrom_df["delta_log_prob"], color="#0f766e", alpha=0.10)
         ax2.set_ylabel(r"$\Delta$ Log Probability", fontsize=11, fontweight="bold")
-        ax3.plot(chrom_df["pos"], chrom_df["l2_distance"], color="darkorange", marker="^", linestyle="-", linewidth=1.5, alpha=0.8)
-        ax3.fill_between(chrom_df["pos"], chrom_df["l2_distance"], color="darkorange", alpha=0.1)
+        ax3.plot(chrom_df["pos"], chrom_df["l2_distance"], color="#b45309", marker="^", linestyle="-", linewidth=1.7, alpha=0.9)
+        ax3.fill_between(chrom_df["pos"], chrom_df["l2_distance"], color="#b45309", alpha=0.10)
         ax3.set_ylabel(r"$L2$ Distance", fontsize=11, fontweight="bold")
         ax3.set_xlabel(f"Genomic Position along {chrom} (bp)", fontsize=12, fontweight="bold")
         for ax in [ax1, ax2, ax3]:
             ax.ticklabel_format(style="plain", axis="x")
-            ax.xaxis.grid(True, linestyle=":", alpha=0.6)
+            ax.xaxis.grid(True, linestyle=":", alpha=0.65)
+            ax.yaxis.grid(True, linestyle="-", alpha=0.35)
+            ax.set_facecolor("#ffffff")
+            ax.tick_params(axis="both", labelsize=10, colors="#475569")
+            for spine in ax.spines.values():
+                spine.set_color("#d9e1ec")
         output_filename = RUN_DIR / f"chrom_{chrom}_profile.png"
         plt.tight_layout()
         plt.savefig(output_filename, dpi=300)
@@ -893,14 +1056,33 @@ def map_carbon_variants_with_ucsc(file_path, output_file):
 def generate_cohort_property_plots(file_path):
     df = pd.read_csv(file_path)
     df["Mutation Type"] = df["ref"].astype(str) + " ➔ " + df["alt"].astype(str)
-    sns.set_theme(style="whitegrid")
+    sns.set_theme(
+        style="whitegrid",
+        rc={
+            "axes.facecolor": "#ffffff",
+            "figure.facecolor": "#ffffff",
+            "axes.edgecolor": "#d9e1ec",
+            "grid.color": "#e5eaf2",
+            "text.color": "#111827",
+            "axes.labelcolor": "#111827",
+            "xtick.color": "#475569",
+            "ytick.color": "#475569",
+        },
+    )
+    cohort_palette = ["#2563eb", "#0f766e", "#7c3aed", "#b45309", "#be123c", "#0369a1"]
 
     app_log("Generating Graph 1: Variant Score Distribution...")
     fig, ax = plt.subplots(figsize=(8, 5))
-    sns.histplot(data=df, x="Variant Score", kde=True, color="skyblue", ax=ax, bins=30)
+    fig.patch.set_facecolor("#ffffff")
+    sns.histplot(data=df, x="Variant Score", kde=True, color="#2563eb", ax=ax, bins=30, alpha=0.55, edgecolor="#dbeafe")
     ax.set_title("Distribution of Carbon Variant Scores", fontsize=14, pad=15, fontweight="bold")
     ax.set_xlabel("Variant Score", fontsize=12)
     ax.set_ylabel("Count / Frequency", fontsize=12)
+    ax.set_facecolor("#ffffff")
+    ax.tick_params(axis="both", labelsize=10, colors="#475569")
+    ax.grid(True, color="#e5eaf2", linewidth=0.8)
+    for spine in ax.spines.values():
+        spine.set_color("#d9e1ec")
     plt.tight_layout()
     plt.savefig(RUN_DIR / "1_variant_score_distribution.png", dpi=300)
     plt.close()
@@ -912,10 +1094,17 @@ def generate_cohort_property_plots(file_path):
         gene_counts.columns = ["Mapped Gene", "Count"]
         top_genes = gene_counts.head(15)
         fig, ax = plt.subplots(figsize=(10, 6))
-        sns.barplot(data=top_genes, x="Count", y="Mapped Gene", palette="viridis", ax=ax, hue="Mapped Gene", legend=False)
+        fig.patch.set_facecolor("#ffffff")
+        sns.barplot(data=top_genes, x="Count", y="Mapped Gene", palette=sns.color_palette(cohort_palette, n_colors=len(top_genes)), ax=ax, hue="Mapped Gene", legend=False)
         ax.set_title("Top 15 Most Frequently Mutated Genes", fontsize=14, pad=15, fontweight="bold")
         ax.set_xlabel("Number of Variants Found", fontsize=12)
         ax.set_ylabel("Gene Symbol", fontsize=12)
+        ax.set_facecolor("#ffffff")
+        ax.tick_params(axis="both", labelsize=10, colors="#475569")
+        ax.grid(True, axis="x", color="#e5eaf2", linewidth=0.8)
+        ax.grid(False, axis="y")
+        for spine in ax.spines.values():
+            spine.set_color("#d9e1ec")
         plt.tight_layout()
         plt.savefig(RUN_DIR / "2_top_mutated_genes.png", dpi=300)
         plt.close()
@@ -927,10 +1116,17 @@ def generate_cohort_property_plots(file_path):
     mut_counts.columns = ["Mutation Type", "Count"]
     mut_counts = mut_counts.sort_values(by="Count", ascending=False)
     fig, ax = plt.subplots(figsize=(10, 5))
-    sns.barplot(data=mut_counts, x="Mutation Type", y="Count", palette="flare", ax=ax, hue="Mutation Type", legend=False)
+    fig.patch.set_facecolor("#ffffff")
+    sns.barplot(data=mut_counts, x="Mutation Type", y="Count", palette=sns.color_palette(cohort_palette, n_colors=len(mut_counts)), ax=ax, hue="Mutation Type", legend=False)
     ax.set_title("Genomic Mutation Spectrum (Substitution Frequency)", fontsize=14, pad=15, fontweight="bold")
     ax.set_xlabel("Nucleotide Substitution Type", fontsize=12)
     ax.set_ylabel("Count", fontsize=12)
+    ax.set_facecolor("#ffffff")
+    ax.tick_params(axis="both", labelsize=10, colors="#475569")
+    ax.grid(True, axis="y", color="#e5eaf2", linewidth=0.8)
+    ax.grid(False, axis="x")
+    for spine in ax.spines.values():
+        spine.set_color("#d9e1ec")
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig(RUN_DIR / "3_mutation_spectrum.png", dpi=300)
