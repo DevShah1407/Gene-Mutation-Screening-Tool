@@ -63,16 +63,11 @@ os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import py3Dmol
-import pysam
 import requests
-import seaborn as sns
 import streamlit as st
 import streamlit.components.v1 as components
-from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
 
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
@@ -874,21 +869,9 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             st.caption(f"Latest completed step: {stage_label}")
         render_pipeline_status_badges(structure_result)
 
-        output_checks = [
-            ("VCF", VCF_PATH),
-            ("Carbon scores", CARBON_CSV),
-            ("Mapped variants", MAPPED_CSV),
-            ("VEP output", VEP_CSV),
-            ("Output ZIP", ZIP_PATH),
-        ]
-        status_cols = st.columns(len(output_checks))
-        for idx, (label, path) in enumerate(output_checks):
-            status_cols[idx].metric(label, "Ready" if path.exists() else "Pending")
-
         if CARBON_CSV.exists():
             carbon_preview = read_csv_safely(CARBON_CSV, "live Carbon score preview")
             if carbon_preview is not None:
-                st.markdown('<div class="carbon-section-title">Carbon Scores Ready</div>', unsafe_allow_html=True)
                 st.markdown('<div class="carbon-section-title">Carbon Scores Available</div>', unsafe_allow_html=True)
                 st.dataframe(carbon_preview.head(10), width="stretch")
 
@@ -897,7 +880,6 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             mapped_preview = read_csv_safely(MAPPED_CSV, "live mapped variant preview")
             if mapped_preview is not None:
                 with live_cols[0]:
-                    st.markdown('<div class="carbon-section-title">Mapped Variants Ready</div>', unsafe_allow_html=True)
                     st.markdown('<div class="carbon-section-title">Mapped Variants Available</div>', unsafe_allow_html=True)
                     st.dataframe(mapped_preview.head(8), width="stretch")
 
@@ -905,7 +887,6 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             vep_preview = read_csv_safely(VEP_CSV, "live VEP preview")
             if vep_preview is not None:
                 with live_cols[1]:
-                    st.markdown('<div class="carbon-section-title">VEP Output Ready</div>', unsafe_allow_html=True)
                     st.markdown('<div class="carbon-section-title">VEP Output Available</div>', unsafe_allow_html=True)
                     st.dataframe(vep_preview.head(8), width="stretch")
 
@@ -916,7 +897,6 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
         ]
         visible_live_plots = [plot for plot in live_plots if plot.exists()]
         if visible_live_plots:
-            st.markdown('<div class="carbon-section-title">Plots Ready</div>', unsafe_allow_html=True)
             st.markdown('<div class="carbon-section-title">Plots Available</div>', unsafe_allow_html=True)
             plot_cols = st.columns(min(3, len(visible_live_plots)))
             for idx, plot_path in enumerate(visible_live_plots[:3]):
@@ -1209,6 +1189,8 @@ def convert_maf_to_vcf(maf_path, vcf_path):
 
 
 def download_and_prepare_hg38():
+    import pysam
+
     if not FASTA_PATH.exists():
         if not FASTA_GZ_PATH.exists():
             app_log("Downloading hg38.fa.gz from UCSC...")
@@ -1231,6 +1213,8 @@ def download_and_prepare_hg38():
 
 
 def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
+    import pysam
+
     app_log("Loading genome index...")
     genome = pysam.FastaFile(str(fasta_path))
     df = pd.read_csv(
@@ -1428,6 +1412,9 @@ def run_carbon_inference(dataset, output_csv, progress_callback=None):
 
 
 def generate_chromosome_plots(csv_path):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
     df = pd.read_csv(csv_path)
     sns.set_theme(
         style="whitegrid",
@@ -1525,6 +1512,9 @@ def map_carbon_variants_with_ucsc(file_path, output_file):
 
 
 def generate_cohort_property_plots(file_path):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
     df = pd.read_csv(file_path)
     df["Mutation Type"] = df["ref"].astype(str) + " ➔ " + df["alt"].astype(str)
     sns.set_theme(
@@ -1766,6 +1756,8 @@ def get_pdb_ids(uniprot_id):
 
 
 def retrieve_pdb_mmcif(pdb_id):
+    from Bio.PDB import PDBList
+
     pdbl = PDBList()
     expected = PDB_DIR / f"{pdb_id.lower()}.cif"
     if expected.exists():
@@ -1813,6 +1805,8 @@ def parse_int_residue(value):
 
 
 def inspect_structure_residue(cif_path, target_residue):
+    from Bio.PDB import MMCIFParser
+
     cif_size = get_file_size(cif_path)
     if cif_size is None:
         raise ValueError(f"structure file is not readable: {cif_path}")
@@ -1887,6 +1881,8 @@ def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_
                             atom.set_bfactor(float(carbon_score))
                             modified_atoms += 1
         if modified_atoms > 0:
+            from Bio.PDB import MMCIFIO
+
             io = MMCIFIO()
             io.set_structure(structure)
             io.save(output_path)
@@ -1897,14 +1893,6 @@ def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_
     except Exception as e:
         app_log(f"Error parsing or writing structural file '{cif_filename}': {e}")
     return None
-
-
-class VariantEnvironmentSelect(Select):
-    def __init__(self, valid_chains):
-        self.valid_chains = valid_chains
-
-    def accept_chain(self, chain):
-        return 1 if chain.id in self.valid_chains else 0
 
 
 def get_structure_candidates(vep_df):
@@ -1920,6 +1908,15 @@ def get_structure_candidates(vep_df):
 
 
 def create_variant_slice(input_cif, output_slice_cif, target_residue):
+    from Bio.PDB import MMCIFIO, Select
+
+    class VariantEnvironmentSelect(Select):
+        def __init__(self, valid_chains):
+            self.valid_chains = valid_chains
+
+        def accept_chain(self, chain):
+            return 1 if chain.id in self.valid_chains else 0
+
     target_residue = parse_int_residue(target_residue)
     if target_residue is None:
         return {"success": False, "reason": "invalid target residue", "chains_to_keep": []}
@@ -1966,6 +1963,8 @@ def create_variant_slice(input_cif, output_slice_cif, target_residue):
 
 
 def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, carbon_score):
+    import py3Dmol
+
     target_residue = parse_int_residue(target_residue)
     if target_residue is None:
         return {"success": False, "reason": "invalid target residue", "html": None}
@@ -2303,7 +2302,6 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
         "VEP mapping",
         "Protein structure mapping",
         "Output package",
-        "Complete",
         "Analysis finished",
     ]
 
@@ -2364,7 +2362,6 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
     with timed_stage("ZIP creation"):
         create_outputs_zip_nonfatal()
     render_live_outputs(live_box, "Output package ready", structure_result=structure_result)
-    update(11, "Complete")
     update(11, "Analysis finished")
     app_log(f"[TIMER] Full pipeline completed in {time.perf_counter() - pipeline_start:.2f}s.")
     return structure_result
@@ -2432,7 +2429,6 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
                 index=0,
             )
 
-    tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads"])
     tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads", "Clinical Interpretation", "AI Assistant"])
 
     cohort_plots = [
