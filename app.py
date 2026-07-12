@@ -63,11 +63,16 @@ os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import py3Dmol
+import pysam
 import requests
+import seaborn as sns
 import streamlit as st
 import streamlit.components.v1 as components
+from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
 
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
@@ -869,9 +874,21 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             st.caption(f"Latest completed step: {stage_label}")
         render_pipeline_status_badges(structure_result)
 
+        output_checks = [
+            ("VCF", VCF_PATH),
+            ("Carbon scores", CARBON_CSV),
+            ("Mapped variants", MAPPED_CSV),
+            ("VEP output", VEP_CSV),
+            ("Output ZIP", ZIP_PATH),
+        ]
+        status_cols = st.columns(len(output_checks))
+        for idx, (label, path) in enumerate(output_checks):
+            status_cols[idx].metric(label, "Ready" if path.exists() else "Pending")
+
         if CARBON_CSV.exists():
             carbon_preview = read_csv_safely(CARBON_CSV, "live Carbon score preview")
             if carbon_preview is not None:
+                st.markdown('<div class="carbon-section-title">Carbon Scores Ready</div>', unsafe_allow_html=True)
                 st.markdown('<div class="carbon-section-title">Carbon Scores Available</div>', unsafe_allow_html=True)
                 st.dataframe(carbon_preview.head(10), width="stretch")
 
@@ -880,6 +897,7 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             mapped_preview = read_csv_safely(MAPPED_CSV, "live mapped variant preview")
             if mapped_preview is not None:
                 with live_cols[0]:
+                    st.markdown('<div class="carbon-section-title">Mapped Variants Ready</div>', unsafe_allow_html=True)
                     st.markdown('<div class="carbon-section-title">Mapped Variants Available</div>', unsafe_allow_html=True)
                     st.dataframe(mapped_preview.head(8), width="stretch")
 
@@ -887,6 +905,7 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             vep_preview = read_csv_safely(VEP_CSV, "live VEP preview")
             if vep_preview is not None:
                 with live_cols[1]:
+                    st.markdown('<div class="carbon-section-title">VEP Output Ready</div>', unsafe_allow_html=True)
                     st.markdown('<div class="carbon-section-title">VEP Output Available</div>', unsafe_allow_html=True)
                     st.dataframe(vep_preview.head(8), width="stretch")
 
@@ -897,6 +916,7 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
         ]
         visible_live_plots = [plot for plot in live_plots if plot.exists()]
         if visible_live_plots:
+            st.markdown('<div class="carbon-section-title">Plots Ready</div>', unsafe_allow_html=True)
             st.markdown('<div class="carbon-section-title">Plots Available</div>', unsafe_allow_html=True)
             plot_cols = st.columns(min(3, len(visible_live_plots)))
             for idx, plot_path in enumerate(visible_live_plots[:3]):
@@ -1895,6 +1915,14 @@ def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_
     return None
 
 
+class VariantEnvironmentSelect(Select):
+    def __init__(self, valid_chains):
+        self.valid_chains = valid_chains
+
+    def accept_chain(self, chain):
+        return 1 if chain.id in self.valid_chains else 0
+
+
 def get_structure_candidates(vep_df):
     candidates = vep_df[(vep_df["Real Mapped Target"].astype(str) != "Intergenic / Non-coding") & (vep_df["Protein_Position"].astype(str) != "N/A")].copy()
     if candidates.empty:
@@ -2302,6 +2330,7 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
         "VEP mapping",
         "Protein structure mapping",
         "Output package",
+        "Complete",
         "Analysis finished",
     ]
 
@@ -2362,6 +2391,7 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
     with timed_stage("ZIP creation"):
         create_outputs_zip_nonfatal()
     render_live_outputs(live_box, "Output package ready", structure_result=structure_result)
+    update(11, "Complete")
     update(11, "Analysis finished")
     app_log(f"[TIMER] Full pipeline completed in {time.perf_counter() - pipeline_start:.2f}s.")
     return structure_result
@@ -2429,6 +2459,7 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
                 index=0,
             )
 
+    tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads"])
     tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads", "Clinical Interpretation", "AI Assistant"])
 
     cohort_plots = [
