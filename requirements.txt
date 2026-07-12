@@ -1,14 +1,26 @@
 streamlit>=1.49,<1.60
-pandas==2.2.3
-numpy==1.26.4
-matplotlib==3.8.4
-seaborn==0.13.2
 requests==2.32.3
-torch @ https://download.pytorch.org/whl/cpu/torch-2.3.1%2Bcpu-cp311-cp311-linux_x86_64.whl ; python_version == "3.11" and platform_system == "Linux" and platform_machine == "x86_64"
-transformers==4.44.2
-accelerate==0.34.2
-safetensors==0.4.5
-py3Dmol==2.4.2
-biopython==1.84
+seaborn==0.13.2
+py3Dmol>=2.4.2,<3
 gspread==6.1.4
 google-auth==2.35.0
+
+pandas==2.2.3 ; python_version < "3.13"
+numpy==1.26.4 ; python_version < "3.13"
+matplotlib==3.8.4 ; python_version < "3.13"
+torch @ https://download.pytorch.org/whl/cpu/torch-2.3.1%2Bcpu-cp311-cp311-linux_x86_64.whl ; python_version == "3.11" and platform_system == "Linux" and platform_machine == "x86_64"
+torch @ https://download.pytorch.org/whl/cpu/torch-2.3.1%2Bcpu-cp312-cp312-linux_x86_64.whl ; python_version == "3.12" and platform_system == "Linux" and platform_machine == "x86_64"
+transformers==4.44.2 ; python_version < "3.13"
+accelerate==0.34.2 ; python_version < "3.13"
+safetensors==0.4.5 ; python_version < "3.13"
+biopython==1.84 ; python_version < "3.13"
+
+pandas==3.0.3 ; python_version >= "3.13"
+numpy==2.5.1 ; python_version >= "3.13"
+matplotlib==3.11.0 ; python_version >= "3.13"
+torch @ https://download.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl ; python_version == "3.13" and platform_system == "Linux" and platform_machine == "x86_64"
+torch @ https://download.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp314-cp314-manylinux_2_28_x86_64.whl ; python_version == "3.14" and platform_system == "Linux" and platform_machine == "x86_64"
+transformers==5.13.1 ; python_version >= "3.13"
+accelerate==1.14.0 ; python_version >= "3.13"
+safetensors==0.8.0 ; python_version >= "3.13"
+biopython==1.87 ; python_version >= "3.13"
