@@ -7,10 +7,8 @@ one MAF upload and one button execute the same disk-based pipeline.
 
 import csv
 import gc
-import gzip
 import html
 import os
-import shutil
 import tempfile
 import time
 import uuid
@@ -18,7 +16,6 @@ import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.request import urlretrieve
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -63,16 +60,11 @@ os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import py3Dmol
-import pysam
 import requests
-import seaborn as sns
 import streamlit as st
 import streamlit.components.v1 as components
-from Bio.PDB import MMCIFIO, MMCIFParser, PDBList, Select
 
 
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
@@ -100,7 +92,6 @@ GOOGLE_SHEETS_HEADER = [
 
 MAF_PATH = RUN_DIR / "input.maf"
 VCF_PATH = RUN_DIR / "glioma_mutations.vcf"
-FASTA_GZ_PATH = RUN_DIR / "hg38.fa.gz"
 FASTA_PATH = RUN_DIR / "hg38.fa"
 CARBON_CSV = RUN_DIR / "carbon_variant_scores.csv"
 MAPPED_CSV = RUN_DIR / "mapped_carbon_variants.csv"
@@ -500,6 +491,35 @@ def read_csv_safely(path, label):
     return None
 
 
+def request_with_retries(method, url, *, max_attempts=3, backoff_seconds=0.75, retry_statuses=None, **kwargs):
+    retry_statuses = retry_statuses or {429, 500, 502, 503, 504}
+    last_error = None
+    method = str(method).upper()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.request(method, url, **kwargs)
+            if response.status_code in retry_statuses and attempt < max_attempts:
+                wait_time = backoff_seconds * (2 ** (attempt - 1))
+                app_log(f"{method} {url} returned HTTP {response.status_code}; retrying in {wait_time:.2f}s.")
+                time.sleep(wait_time)
+                continue
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            wait_time = backoff_seconds * (2 ** (attempt - 1))
+            app_log(f"{method} {url} failed on attempt {attempt}/{max_attempts}: {exc}; retrying in {wait_time:.2f}s.")
+            time.sleep(wait_time)
+    raise last_error
+
+
+def request_json_with_retries(method, url, **kwargs):
+    response = request_with_retries(method, url, **kwargs)
+    return response.json()
+
+
 def status_badge_html(status, text=None):
     labels = {
         "completed": "✓ Completed",
@@ -524,13 +544,13 @@ def get_pipeline_stage_statuses(structure_result=None):
         (RUN_DIR / filename).exists()
         for filename in ["1_variant_score_distribution.png", "2_top_mutated_genes.png", "3_mutation_spectrum.png"]
     )
-    fasta_ready = FASTA_PATH.exists() and Path(f"{FASTA_PATH}.fai").exists()
+    reference_ready = bool(st.session_state.get("reference_context_ready")) or CARBON_CSV.exists()
     current_message = str(st.session_state.get("current_pipeline_message", "")).lower()
 
     stages = [
         ("MAF Uploaded", MAF_PATH.exists(), "upload"),
         ("MAF to VCF", VCF_PATH.exists(), "vcf"),
-        ("Genome Prepared", fasta_ready, "genome"),
+        ("hg38 Reference Access", reference_ready, "genome"),
         ("Context Extraction", CARBON_CSV.exists(), "context"),
         ("Carbon Scoring", CARBON_CSV.exists(), "carbon"),
         ("Chromosome Plots", chromosome_plot_ready, "chromosome"),
@@ -874,21 +894,9 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             st.caption(f"Latest completed step: {stage_label}")
         render_pipeline_status_badges(structure_result)
 
-        output_checks = [
-            ("VCF", VCF_PATH),
-            ("Carbon scores", CARBON_CSV),
-            ("Mapped variants", MAPPED_CSV),
-            ("VEP output", VEP_CSV),
-            ("Output ZIP", ZIP_PATH),
-        ]
-        status_cols = st.columns(len(output_checks))
-        for idx, (label, path) in enumerate(output_checks):
-            status_cols[idx].metric(label, "Ready" if path.exists() else "Pending")
-
         if CARBON_CSV.exists():
             carbon_preview = read_csv_safely(CARBON_CSV, "live Carbon score preview")
             if carbon_preview is not None:
-                st.markdown('<div class="carbon-section-title">Carbon Scores Ready</div>', unsafe_allow_html=True)
                 st.markdown('<div class="carbon-section-title">Carbon Scores Available</div>', unsafe_allow_html=True)
                 st.dataframe(carbon_preview.head(10), width="stretch")
 
@@ -897,7 +905,6 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             mapped_preview = read_csv_safely(MAPPED_CSV, "live mapped variant preview")
             if mapped_preview is not None:
                 with live_cols[0]:
-                    st.markdown('<div class="carbon-section-title">Mapped Variants Ready</div>', unsafe_allow_html=True)
                     st.markdown('<div class="carbon-section-title">Mapped Variants Available</div>', unsafe_allow_html=True)
                     st.dataframe(mapped_preview.head(8), width="stretch")
 
@@ -905,7 +912,6 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
             vep_preview = read_csv_safely(VEP_CSV, "live VEP preview")
             if vep_preview is not None:
                 with live_cols[1]:
-                    st.markdown('<div class="carbon-section-title">VEP Output Ready</div>', unsafe_allow_html=True)
                     st.markdown('<div class="carbon-section-title">VEP Output Available</div>', unsafe_allow_html=True)
                     st.dataframe(vep_preview.head(8), width="stretch")
 
@@ -916,7 +922,6 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
         ]
         visible_live_plots = [plot for plot in live_plots if plot.exists()]
         if visible_live_plots:
-            st.markdown('<div class="carbon-section-title">Plots Ready</div>', unsafe_allow_html=True)
             st.markdown('<div class="carbon-section-title">Plots Available</div>', unsafe_allow_html=True)
             plot_cols = st.columns(min(3, len(visible_live_plots)))
             for idx, plot_path in enumerate(visible_live_plots[:3]):
@@ -1209,34 +1214,28 @@ def convert_maf_to_vcf(maf_path, vcf_path):
 
 
 def download_and_prepare_hg38():
-    import pysam
-
-    if not FASTA_PATH.exists():
-        if not FASTA_GZ_PATH.exists():
-            app_log("Downloading hg38.fa.gz from UCSC...")
-            urlretrieve(
-                "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz",
-                FASTA_GZ_PATH,
-            )
-
-        app_log("Decompressing genome...")
-        with gzip.open(FASTA_GZ_PATH, "rb") as compressed:
-            with open(FASTA_PATH, "wb") as fasta:
-                shutil.copyfileobj(compressed, fasta)
-
-    if not Path(f"{FASTA_PATH}.fai").exists():
-        app_log("Indexing genome with pysam...")
-        pysam.faidx(str(FASTA_PATH))
-
-    app_log("Genome ready!")
+    st.session_state["reference_context_ready"] = True
+    app_log("hg38 reference access ready through the cached UCSC sequence API.")
     return FASTA_PATH
 
 
-def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
-    import pysam
+@st.cache_data(show_spinner=False, ttl=86400)
+def fetch_hg38_sequence(chrom, start, end):
+    chrom_str = str(chrom)
+    chrom_fixed = chrom_str if chrom_str.lower().startswith("chr") else f"chr{chrom_str}"
+    start = max(0, int(start))
+    end = max(start + 1, int(end))
+    url = "https://api.genome.ucsc.edu/getData/sequence"
+    params = {"genome": "hg38", "chrom": chrom_fixed, "start": start, "end": end}
+    data = request_json_with_retries("GET", url, params=params, timeout=20)
+    dna = str(data.get("dna", "")).upper()
+    if not dna:
+        raise RuntimeError(f"UCSC returned no hg38 sequence for {chrom_fixed}:{start}-{end}.")
+    return dna
 
-    app_log("Loading genome index...")
-    genome = pysam.FastaFile(str(fasta_path))
+
+def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
+    app_log("Fetching hg38 mutation contexts from UCSC sequence API...")
     df = pd.read_csv(
         vcf_path,
         sep="\t",
@@ -1253,8 +1252,18 @@ def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
         alt = str(row["ALT"])
         start = max(0, pos - half_window)
         end = pos + half_window
-        wt_seq = genome.fetch(chrom, start, end).upper()
+        try:
+            wt_seq = fetch_hg38_sequence(chrom, start, end)
+        except Exception as exc:
+            app_log(f"Skipping {chrom}:{pos} because hg38 context could not be retrieved: {exc}")
+            continue
         mutation_idx = pos - start - 1
+        if mutation_idx < 0 or mutation_idx >= len(wt_seq):
+            app_log(
+                f"Skipping {chrom}:{pos} because the mutation index {mutation_idx} "
+                f"is outside the fetched context length {len(wt_seq)}."
+            )
+            continue
         mut_seq = wt_seq[:mutation_idx] + alt + wt_seq[mutation_idx + 1 :]
         prepared_data.append(
             {
@@ -1268,6 +1277,8 @@ def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
         )
 
     app_log(f"Done! Successfully extracted contexts for {len(prepared_data)} variants.")
+    if not prepared_data:
+        raise RuntimeError("No hg38 mutation contexts could be extracted. Check UCSC availability and input coordinates.")
     return prepared_data
 
 
@@ -1493,16 +1504,21 @@ def generate_chromosome_plots(csv_path):
 def identify_gene_via_ucsc(chrom, pos):
     chrom_str = str(chrom)
     chrom_fixed = chrom_str if chrom_str.lower().startswith("chr") else f"chr{chrom_str}"
-    url = f"https://api.genome.ucsc.edu/getData/track?genome=hg38;track=ncbiRefSeq;chrom={chrom_fixed};start={pos-1000};end={pos+1000}"
+    url = "https://api.genome.ucsc.edu/getData/track"
+    params = {
+        "genome": "hg38",
+        "track": "ncbiRefSeq",
+        "chrom": chrom_fixed,
+        "start": int(pos) - 1000,
+        "end": int(pos) + 1000,
+    }
     try:
-        response = requests.get(url, timeout=5)
-        if response.ok:
-            data = response.json()
-            items = data.get("ncbiRefSeq", [])
-            if items:
-                return items[0].get("name2", "Unknown Feature")
-    except Exception:
-        pass
+        data = request_json_with_retries("GET", url, params=params, timeout=8)
+        items = data.get("ncbiRefSeq", [])
+        if items:
+            return items[0].get("name2", "Unknown Feature")
+    except Exception as exc:
+        app_log(f"UCSC gene lookup failed for {chrom_fixed}:{pos}: {exc}")
     return "Intergenic / Non-coding"
 
 
@@ -1631,9 +1647,8 @@ def query_vep_grch37(chrom, pos, ref, alt, carbon_score):
     try:
         if VEP_REQUEST_DELAY_SECONDS > 0:
             time.sleep(VEP_REQUEST_DELAY_SECONDS)
-        response = requests.get(url, headers=headers, timeout=12)
-        if response.ok and response.json():
-            results = response.json()
+        results = request_json_with_retries("GET", url, headers=headers, timeout=12)
+        if results:
             tc_list = results[0].get("transcript_consequences", [])
             selected_tc = None
             for tc in tc_list:
@@ -1698,11 +1713,7 @@ def search_uniprot_accession_by_gene(gene_name, organism_id="9606"):
         "size": 1,
     }
     try:
-        response = requests.get(url, params=params, timeout=12)
-        if not response.ok:
-            app_log(f"UniProt search fallback failed for {gene_name}: HTTP {response.status_code}")
-            return None
-        results = response.json().get("results", [])
+        results = request_json_with_retries("GET", url, params=params, timeout=12).get("results", [])
         if results:
             accession = results[0].get("primaryAccession")
             if accession:
@@ -1717,26 +1728,31 @@ def search_uniprot_accession_by_gene(gene_name, organism_id="9606"):
 def get_uniprot_id(gene_name, organism_id="9606"):
     API_URL = "https://rest.uniprot.org/idmapping"
     payload = {"from": "Gene_Name", "to": "UniProtKB", "ids": gene_name, "taxId": organism_id}
-    submit_res = requests.post(f"{API_URL}/run", data=payload, timeout=12)
-    if submit_res.status_code != 200:
+    try:
+        submit_res = request_with_retries("POST", f"{API_URL}/run", data=payload, timeout=12)
+    except Exception as exc:
+        app_log(f"UniProt ID mapping submission failed for {gene_name}: {exc}")
         return search_uniprot_accession_by_gene(gene_name, organism_id)
     job_id = submit_res.json().get("jobId")
     if not job_id:
         return search_uniprot_accession_by_gene(gene_name, organism_id)
     for _ in range(10):
-        status_res = requests.get(f"{API_URL}/status/{job_id}", timeout=12)
-        if status_res.status_code == 200:
+        try:
+            status_res = request_with_retries("GET", f"{API_URL}/status/{job_id}", timeout=12, max_attempts=2)
             status_data = status_res.json()
             if "results" in status_data or status_data.get("jobStatus") == "FINISHED":
                 break
-        elif status_res.history:
-            break
+        except Exception as exc:
+            app_log(f"UniProt ID mapping status check failed for {gene_name}: {exc}")
+            return search_uniprot_accession_by_gene(gene_name, organism_id)
         time.sleep(2)
     else:
         app_log(f"UniProt lookup timed out for {gene_name}.")
         return search_uniprot_accession_by_gene(gene_name, organism_id)
-    results_res = requests.get(f"{API_URL}/results/{job_id}", timeout=12)
-    if results_res.status_code != 200:
+    try:
+        results_res = request_with_retries("GET", f"{API_URL}/results/{job_id}", timeout=12)
+    except Exception as exc:
+        app_log(f"UniProt ID mapping results retrieval failed for {gene_name}: {exc}")
         return search_uniprot_accession_by_gene(gene_name, organism_id)
     results = results_res.json()
     if isinstance(results, dict) and "results" in results:
@@ -1767,11 +1783,11 @@ def get_pdb_ids(uniprot_id):
         },
         "return_type": "entry",
     }
-    response = requests.post(url, json=query, timeout=15)
-    if response.status_code == 200:
-        results = response.json()
+    try:
+        results = request_json_with_retries("POST", url, json=query, timeout=15)
         return [item["identifier"] for item in results.get("result_set", [])]
-    app_log(f"Error {response.status_code}: {response.text}")
+    except Exception as exc:
+        app_log(f"RCSB lookup failed for UniProt {uniprot_id}: {exc}")
     return []
 
 
@@ -1801,10 +1817,9 @@ def retrieve_alphafold_mmcif(uniprot_id):
         url = f"https://alphafold.ebi.ac.uk/files/AF-{safe_uniprot}-F1-model_{version}.cif"
         try:
             app_log(f"Trying AlphaFold fallback for UniProt={safe_uniprot}: {url}")
-            response = requests.get(url, timeout=25)
+            response = request_with_retries("GET", url, timeout=25, max_attempts=2)
             if response.status_code == 404:
                 continue
-            response.raise_for_status()
             if not response.content.strip():
                 app_log(f"AlphaFold fallback returned an empty file for {safe_uniprot} ({version}).")
                 continue
@@ -1913,14 +1928,6 @@ def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_
     except Exception as e:
         app_log(f"Error parsing or writing structural file '{cif_filename}': {e}")
     return None
-
-
-class VariantEnvironmentSelect(Select):
-    def __init__(self, valid_chains):
-        self.valid_chains = valid_chains
-
-    def accept_chain(self, chain):
-        return 1 if chain.id in self.valid_chains else 0
 
 
 def get_structure_candidates(vep_df):
@@ -2313,15 +2320,15 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
             )
         except Exception as exc:
             app_log(f"Google Sheets analysis logging failed: {exc}")
-            raise RuntimeError(
+            st.warning(
                 "Could not log this analysis submission to Google Sheets. "
-                "Please verify the Streamlit secrets and sheet sharing, then try again."
-            ) from exc
+                "The pipeline will continue because your initial check-in is already complete."
+            )
 
     stages = [
         "Upload complete",
         "MAF conversion",
-        "Genome preparation",
+        "hg38 reference access",
         "Context extraction",
         "Carbon inference",
         "Chromosome plots",
@@ -2330,7 +2337,6 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
         "VEP mapping",
         "Protein structure mapping",
         "Output package",
-        "Complete",
         "Analysis finished",
     ]
 
@@ -2346,10 +2352,10 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
     with timed_stage("MAF to VCF conversion"):
         convert_maf_to_vcf(MAF_PATH, VCF_PATH)
     render_live_outputs(live_box, "glioma_mutations.vcf ready")
-    update(2, "Preparing hg38 reference genome")
-    with timed_stage("Genome download/decompression/indexing"):
+    update(2, "Preparing hg38 reference access")
+    with timed_stage("hg38 reference access"):
         download_and_prepare_hg38()
-    render_live_outputs(live_box, "Reference genome ready")
+    render_live_outputs(live_box, "hg38 reference access ready")
     update(3, "Extracting mutation contexts")
     with timed_stage("Context extraction"):
         dataset = extract_mutation_context(VCF_PATH, FASTA_PATH)
@@ -2391,7 +2397,6 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
     with timed_stage("ZIP creation"):
         create_outputs_zip_nonfatal()
     render_live_outputs(live_box, "Output package ready", structure_result=structure_result)
-    update(11, "Complete")
     update(11, "Analysis finished")
     app_log(f"[TIMER] Full pipeline completed in {time.perf_counter() - pipeline_start:.2f}s.")
     return structure_result
@@ -2459,7 +2464,6 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
                 index=0,
             )
 
-    tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads"])
     tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads", "Clinical Interpretation", "AI Assistant"])
 
     cohort_plots = [
