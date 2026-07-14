@@ -522,6 +522,7 @@ def new_run_paths():
 def reset_current_run_state():
     for key in [
         "structure_result",
+        "structure_results",
         "assistant_messages",
         "current_pipeline_message",
         "reference_context_ready",
@@ -537,6 +538,11 @@ def uploaded_file_signature(uploaded_file):
         return None
     size = getattr(uploaded_file, "size", None)
     return f"{uploaded_file.name}:{size}"
+    try:
+        digest = core.hashlib.sha256(bytes(uploaded_file.getbuffer())).hexdigest()
+    except Exception:
+        digest = "unavailable"
+    return f"{uploaded_file.name}:{size}:{digest}"
 
 
 def reset_display_for_new_upload(uploaded_file):
@@ -1218,11 +1224,20 @@ def log_user_login(full_name, email, institution, role_grade, session_id, status
 
 
 def usage_logging_enabled():
+    env_value = os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING")
+    if env_value is not None:
+        return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
     try:
         value = st.secrets.get("enable_usage_logging", os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING", "false"))
+        if "enable_usage_logging" in st.secrets:
+            return str(st.secrets.get("enable_usage_logging")).strip().lower() in {"1", "true", "yes", "on"}
+        has_sheet = bool(st.secrets.get("google_sheet_id", "") or st.secrets.get("google_sheet_name", ""))
+        has_service_account = "gcp_service_account" in st.secrets
+        return has_sheet and has_service_account
     except Exception:
         value = os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING", "false")
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+        return False
 
 
 def is_valid_email(email):
@@ -2334,6 +2349,101 @@ def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, 
         return {"success": False, "reason": reason, "html": None}
 
 
+def render_structure_view(structure_result, all_structure_results=None, view_mode="Full structure", zoom_to_mutation=False):
+    import py3Dmol
+
+    all_structure_results = all_structure_results or [structure_result]
+    if not structure_result or structure_result.get("skipped"):
+        return {"success": False, "reason": "no mapped structure selected", "html": None, "view_mode": view_mode}
+
+    requested_mode = view_mode
+    structure_path = Path(structure_result.get("mapped_file", ""))
+    fallback_message = ""
+    if view_mode == "Variant-bearing chain only" or view_mode == "Zoomed mutation view":
+        structure_path = Path(structure_result.get("slice_file", ""))
+    elif view_mode == "Full structure":
+        full_size = get_file_size(structure_path)
+        if not structure_path.exists() or not full_size:
+            return {"success": False, "reason": "full mapped structure file is unavailable", "html": None, "view_mode": view_mode}
+        if full_size > MAX_SLICE_BYTES_FOR_RENDERING:
+            structure_path = Path(structure_result.get("slice_file", ""))
+            view_mode = "Variant-bearing chain only"
+            fallback_message = "Full structure was too large, so a reduced variant-bearing chain view is shown."
+
+    if not structure_path.exists():
+        return {"success": False, "reason": f"structure file does not exist: {structure_path}", "html": None, "view_mode": view_mode}
+    structure_size = get_file_size(structure_path)
+    if not structure_size:
+        return {"success": False, "reason": f"structure file is empty: {structure_path}", "html": None, "view_mode": view_mode}
+    if structure_size > MAX_SLICE_BYTES_FOR_RENDERING and view_mode != "Full structure":
+        return {
+            "success": False,
+            "reason": f"selected structure view is too large for browser rendering ({format_bytes(structure_size)})",
+            "html": None,
+            "view_mode": view_mode,
+        }
+
+    selected_residue = parse_int_residue(structure_result.get("target_residue"))
+    selected_chains = structure_result.get("chains") or []
+    mutations_to_highlight = []
+    for result in all_structure_results:
+        same_structure = (
+            result.get("uniprot_id") == structure_result.get("uniprot_id")
+            and result.get("pdb_id") == structure_result.get("pdb_id")
+            and result.get("structure_source") == structure_result.get("structure_source")
+        )
+        if not same_structure:
+            continue
+        residue = parse_int_residue(result.get("target_residue"))
+        if residue is None:
+            continue
+        mutations_to_highlight.append(
+            {
+                "residue": residue,
+                "chains": result.get("chains") or selected_chains,
+                "label": f"{result.get('gene_name', '')} {result.get('amino_acid_mutation', '')}".strip(),
+                "score": result.get("carbon_score", ""),
+                "selected": result is structure_result or (
+                    residue == selected_residue and result.get("amino_acid_mutation") == structure_result.get("amino_acid_mutation")
+                ),
+            }
+        )
+
+    try:
+        structure_data = structure_path.read_text()
+        if not structure_data.strip() or "_atom_site." not in structure_data:
+            return {"success": False, "reason": "selected structure file is not a valid atom-containing mmCIF", "html": None, "view_mode": view_mode}
+
+        view = py3Dmol.view(width=PROTEIN_VIEWER_WIDTH, height=PROTEIN_VIEWER_HEIGHT)
+        view.addModel(structure_data, "cif")
+        view.setStyle({}, {"cartoon": {"color": "#C9D1D9", "opacity": 0.86}})
+        for mutation in mutations_to_highlight:
+            color = "#FF007F" if mutation["selected"] else "#7C3AED"
+            radius = 3.4 if mutation["selected"] else 2.3
+            selection = {"resi": [mutation["residue"]]}
+            if mutation["chains"]:
+                selection["chain"] = mutation["chains"]
+            view.addStyle(selection, {"sphere": {"color": color, "radius": radius}})
+            view.addLabel(
+                f"{mutation['label']}\nResidue: {mutation['residue']}\nCarbon Score: {mutation['score']}",
+                {"fontColor": "white", "backgroundColor": "#111111", "backgroundOpacity": 0.85, "fontSize": 12},
+                selection,
+            )
+        if zoom_to_mutation or requested_mode == "Zoomed mutation view":
+            zoom_selection = {"resi": [selected_residue]} if selected_residue is not None else {}
+            if selected_chains:
+                zoom_selection["chain"] = selected_chains
+            view.zoomTo(zoom_selection)
+        else:
+            view.zoomTo({})
+        html_result = view._make_html()
+        if not is_valid_structure_html(html_result):
+            return {"success": False, "reason": "py3Dmol generated empty or oversized viewer HTML", "html": None, "view_mode": view_mode}
+        return {"success": True, "reason": fallback_message, "html": html_result, "view_mode": view_mode}
+    except Exception as exc:
+        return {"success": False, "reason": f"structure rendering failed: {exc}", "html": None, "view_mode": view_mode}
+
+
 def safe_structure_label(value):
     cleaned = "".join(ch if ch.isalnum() else "_" for ch in str(value).lower()).strip("_")
     return cleaned or "structure"
@@ -2350,6 +2460,8 @@ def try_structure_candidate(
     amino_acid_mutation,
     skipped,
     structure_dir=None,
+    transcript_id="N/A",
+    mutation_label=None,
 ):
     app_log(
         f"Trying structure candidate: source={source_label}, gene={gene_name}, "
@@ -2394,10 +2506,17 @@ def try_structure_candidate(
     )
     return {
         "skipped": False,
+        "mapping_status": "mapped",
         "gene_name": gene_name,
+        "mutation": mutation_label or f"{gene_name} {amino_acid_mutation}",
+        "ensembl_transcript": transcript_id,
         "uniprot_id": uniprot_id,
         "pdb_id": structure_id,
         "structure_source": source_label,
+        "structure_note": (
+            "Experimental PDB structure" if source_label == "PDB"
+            else "AlphaFold predicted single-protein fallback; not necessarily equivalent to an experimental PDB complex"
+        ),
         "target_residue": target_residue,
         "carbon_score": carbon_score,
         "amino_acid_mutation": amino_acid_mutation,
@@ -2406,6 +2525,7 @@ def try_structure_candidate(
         "html": render_result["html"],
         "chains": slice_result.get("chains_to_keep", []),
         "skipped_details": skipped,
+        "skipped_details": list(skipped),
     }
 
 
@@ -2433,8 +2553,11 @@ def run_structure_mapping(vep_csv, paths=None):
         )
         candidates = candidates.head(MAX_STRUCTURE_CANDIDATES)
 
+    successful_results = []
     for candidate_index, row in candidates.iterrows():
         gene_name = str(row["Real Mapped Target"])
+        transcript_id = str(row.get("Ensembl_Transcript", "N/A"))
+        mutation_label = str(row.get("Mutation", f"{gene_name}:{row.get('Protein_Position', 'N/A')}"))
         target_residue = parse_int_residue(row["Protein_Position"])
         if target_residue is None:
             reason = f"{gene_name}: invalid Protein_Position '{row['Protein_Position']}'"
@@ -2500,9 +2623,12 @@ def run_structure_mapping(vep_csv, paths=None):
                     amino_acid_mutation,
                     skipped,
                     structure_dir,
+                    transcript_id,
+                    mutation_label,
                 )
                 if result:
                     return result
+                    successful_results.append(result)
             except Exception as exc:
                 reason = f"{gene_name} ({uniprot_id}, PDB {pdb_id}): unexpected structure candidate failure: {exc}"
                 skipped.append(reason)
@@ -2527,18 +2653,35 @@ def run_structure_mapping(vep_csv, paths=None):
                 amino_acid_mutation,
                 skipped,
                 structure_dir,
+                transcript_id,
+                mutation_label,
             )
             if result:
                 return result
+                successful_results.append(result)
         except Exception as exc:
             reason = f"{gene_name} ({uniprot_id}, AlphaFold): unexpected fallback failure: {exc}"
             skipped.append(reason)
             app_log(reason)
             continue
 
+    if successful_results:
+        successful_results = sorted(
+            successful_results,
+            key=lambda item: (0 if item.get("structure_source") == "PDB" else 1, -abs(float(item.get("carbon_score", 0.0)))),
+        )
+        selected = dict(successful_results[0])
+        selected["structure_results"] = successful_results
+        selected["skipped_details"] = skipped
+        app_log(f"Structure mapping produced {len(successful_results)} renderable protein/variant view(s).")
+        return selected
+
     message = "Protein structure mapping skipped: no available PDB or AlphaFold candidate contained and rendered the target residue."
     app_log(message)
     return make_skipped_structure_result(message, skipped)
+    skipped_result = make_skipped_structure_result(message, skipped)
+    skipped_result["structure_results"] = []
+    return skipped_result
 
 
 def collect_output_files(paths):
@@ -2580,6 +2723,9 @@ def run_structure_mapping_nonfatal(vep_csv, paths=None):
         message = f"Protein structure mapping skipped after a protected late-stage failure: {exc}"
         app_log(message)
         return make_skipped_structure_result(message, [message])
+        result = make_skipped_structure_result(message, [message])
+        result["structure_results"] = []
+        return result
 
 
 def create_outputs_zip_nonfatal(paths):
@@ -2718,6 +2864,8 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
     with timed_stage("Structure mapping"):
         stage = begin_stage("Structure mapping")
         structure_result = run_structure_mapping_nonfatal(paths.vep_csv, paths)
+        st.session_state["structure_result"] = structure_result
+        st.session_state["structure_results"] = structure_result.get("structure_results", [])
         stage_status = "skipped" if structure_result.get("skipped") else "success"
         if structure_result.get("skipped"):
             stage.warnings.extend(structure_result.get("skipped_details", []))
@@ -2751,6 +2899,149 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
     return structure_result
 
 
+def build_protein_mapping_table(vep_df, structure_results):
+    mapped_rows = []
+    structure_results = structure_results or []
+    for _, row in (vep_df if vep_df is not None else pd.DataFrame()).iterrows():
+        protein_pos = str(row.get("Protein_Position", "N/A"))
+        if protein_pos == "N/A" or not protein_pos.strip():
+            continue
+        gene = str(row.get("Real Mapped Target", ""))
+        aa_mut = str(row.get("Amino_Acid_Mutation", "N/A"))
+        matches = [
+            result for result in structure_results
+            if str(result.get("gene_name", "")) == gene
+            and str(result.get("target_residue", "")) == str(parse_int_residue(protein_pos))
+        ]
+        mapped_rows.append(
+            {
+                "Gene": gene,
+                "Mutation": row.get("Mutation", ""),
+                "Ensembl Transcript": row.get("Ensembl_Transcript", "N/A"),
+                "Protein Position": protein_pos,
+                "Amino Acid Mutation": aa_mut,
+                "Carbon Score": row.get("Carbon Score", ""),
+                "UniProt ID": ", ".join(sorted({m.get("uniprot_id", "") for m in matches if m.get("uniprot_id")})) or "N/A",
+                "Structure Source": ", ".join(sorted({f"{m.get('structure_source')} {m.get('pdb_id')}" for m in matches if m.get("pdb_id")})) or "Not mapped",
+                "Mapping Status": "mapped" if matches else "not mapped",
+            }
+        )
+    return pd.DataFrame(mapped_rows)
+
+
+def render_protein_mapping_dashboard(vep_df, chromosome_plots):
+    st.markdown('<div class="carbon-section-title">Protein Mapping Dashboard</div>', unsafe_allow_html=True)
+    structure_result = st.session_state.get("structure_result")
+    structure_results = st.session_state.get("structure_results") or []
+    if not structure_results and structure_result and not structure_result.get("skipped"):
+        structure_results = structure_result.get("structure_results") or [structure_result]
+
+    protein_table = build_protein_mapping_table(vep_df, structure_results)
+
+    if not structure_results:
+        if structure_result:
+            st.warning(structure_result.get("message", "Protein structure mapping did not produce a renderable viewer for this run."))
+            skipped_details = structure_result.get("skipped_details", [])
+            if skipped_details:
+                with st.expander("Structure mapping candidate details", expanded=True):
+                    for detail in skipped_details:
+                        st.write(f"- {detail}")
+        else:
+            st.info("The protein viewer will appear after structure candidates are mapped.")
+        if not protein_table.empty:
+            st.markdown('<div class="carbon-section-title">Protein-Coding VEP Rows</div>', unsafe_allow_html=True)
+            st.dataframe(protein_table, width="stretch")
+        return
+
+    options = [
+        (
+            f"{idx + 1}. {result.get('gene_name', 'Gene')} "
+            f"{result.get('amino_acid_mutation', 'mutation')} | "
+            f"{result.get('structure_source', 'Structure')} {result.get('pdb_id', '')} | "
+            f"score {float(result.get('carbon_score', 0.0)):.4f}"
+        )
+        for idx, result in enumerate(structure_results)
+    ]
+    selected_label = st.selectbox("Select mapped protein/variant to view", options, index=0)
+    selected_index = options.index(selected_label)
+    selected_result = structure_results[selected_index]
+    st.session_state["structure_result"] = selected_result
+
+    view_mode = st.radio(
+        "Structure view",
+        ["Full structure", "Variant-bearing chain only", "Zoomed mutation view"],
+        index=0,
+        horizontal=True,
+    )
+    zoom_clicked = st.button("Zoom to mutation")
+
+    viewer_col, detail_col = st.columns([2.1, 1])
+    with viewer_col:
+        render_result = render_structure_view(
+            selected_result,
+            structure_results,
+            view_mode=view_mode,
+            zoom_to_mutation=zoom_clicked,
+        )
+        if render_result.get("success") and is_valid_structure_html(render_result.get("html")):
+            if render_result.get("reason"):
+                st.warning(render_result["reason"])
+            st.caption(
+                f"Showing: {render_result.get('view_mode', view_mode)} | "
+                f"{selected_result.get('structure_source')} {selected_result.get('pdb_id')}"
+            )
+            components.html(render_result["html"], height=PROTEIN_VIEWER_HEIGHT + 40, scrolling=False)
+        elif is_valid_structure_html(selected_result.get("html")):
+            st.warning(render_result.get("reason", "Full structure rendering failed; showing cached reduced variant-chain viewer."))
+            components.html(selected_result["html"], height=PROTEIN_VIEWER_HEIGHT + 40, scrolling=False)
+        else:
+            st.warning(render_result.get("reason", "Selected structure could not be rendered."))
+
+    with detail_col:
+        source = selected_result.get("structure_source", "Structure")
+        structure_id = selected_result.get("pdb_id", "")
+        st.markdown('<div class="carbon-section-title">Selected Variant Details</div>', unsafe_allow_html=True)
+        st.write(f"Gene: `{selected_result.get('gene_name', 'N/A')}`")
+        st.write(f"Mutation: `{selected_result.get('amino_acid_mutation', 'N/A')}`")
+        st.write(f"Protein position: `{selected_result.get('target_residue', 'N/A')}`")
+        st.write(f"Carbon score: `{selected_result.get('carbon_score', 'N/A')}`")
+        st.write(f"UniProt ID: `{selected_result.get('uniprot_id', 'N/A')}`")
+        st.write(f"Transcript: `{selected_result.get('ensembl_transcript', 'N/A')}`")
+        st.write(f"Structure source: `{source} {structure_id}`")
+        st.write(f"Viewer status: `{view_mode}`")
+        if selected_result.get("chains"):
+            st.write(f"Variant-bearing chains: `{', '.join(selected_result['chains'])}`")
+        if source == "AlphaFold":
+            st.warning(
+                "AlphaFold fallback used: this is a predicted single-protein model and is not the same as an experimental PDB complex."
+            )
+        else:
+            st.success("Experimental PDB structure selected.")
+        if selected_result.get("mapped_file"):
+            st.caption(f"Mapped structure: {selected_result['mapped_file']}")
+        if selected_result.get("slice_file"):
+            st.caption(f"Variant slice: {selected_result['slice_file']}")
+
+    st.markdown('<div class="carbon-section-title">Mapped VEP / Protein Table</div>', unsafe_allow_html=True)
+    if not protein_table.empty:
+        st.dataframe(protein_table, width="stretch")
+    else:
+        st.info("No VEP rows with usable protein positions were available.")
+
+    skipped_details = selected_result.get("skipped_details") or structure_result.get("skipped_details", []) if structure_result else []
+    if skipped_details:
+        with st.expander("Skipped structure candidates and fallback reasons", expanded=False):
+            for detail in skipped_details:
+                st.write(f"- {detail}")
+
+    if chromosome_plots:
+        with st.expander("Chromosome score plots for context", expanded=False):
+            plot_cols = st.columns(2)
+            for idx, plot_path in enumerate(chromosome_plots[:6]):
+                with plot_cols[idx % 2]:
+                    st.image(str(plot_path), caption=plot_path.name, width=IMAGE_PREVIEW_WIDTH)
+
+
 ensure_login()
 
 st.title("CarbonVEP")
@@ -2768,6 +3059,7 @@ if run_clicked and uploaded_maf is not None:
         with st.spinner("Running full CarbonVEP pipeline..."):
             structure_result = run_full_pipeline(uploaded_maf, progress_bar, status_box, live_results_box)
         st.session_state["structure_result"] = structure_result
+        st.session_state["structure_results"] = structure_result.get("structure_results", [])
         if st.session_state.get("run_status") == "complete_with_warnings":
             st.warning("CarbonVEP analysis completed with warnings. Review the run log and protein mapping details.")
         else:
@@ -2920,6 +3212,7 @@ if current_paths and (current_paths.carbon_csv.exists() or current_paths.mapped_
                             st.write(f"- {detail}")
         else:
             st.info("The protein viewer will appear after a structure candidate is successfully mapped.")
+        render_protein_mapping_dashboard(vep_df, chromosome_plots)
 
     with tabs[5]:
         st.markdown('<div class="carbon-section-title">Pipeline Output Package</div>', unsafe_allow_html=True)
