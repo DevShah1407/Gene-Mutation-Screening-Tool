@@ -73,9 +73,11 @@ PREVIEW_ROWS = 25
 IMAGE_PREVIEW_WIDTH = 520
 MAX_STRUCTURE_CANDIDATES = 8
 MAX_PDB_IDS_PER_UNIPROT = 8
-MAX_CIF_BYTES_FOR_MAPPING = 20 * 1024 * 1024
-MAX_SLICE_BYTES_FOR_RENDERING = 5 * 1024 * 1024
-MAX_VIEWER_HTML_CHARS = 2_000_000
+MAX_CIF_BYTES_FOR_MAPPING = int(os.environ.get("CARBONVEP_MAX_CIF_BYTES", str(120 * 1024 * 1024)))
+MAX_SLICE_BYTES_FOR_RENDERING = int(os.environ.get("CARBONVEP_MAX_SLICE_BYTES", str(35 * 1024 * 1024)))
+MAX_VIEWER_HTML_CHARS = int(os.environ.get("CARBONVEP_MAX_VIEWER_HTML_CHARS", "50000000"))
+PROTEIN_VIEWER_WIDTH = 800
+PROTEIN_VIEWER_HEIGHT = 600
 MAX_INLINE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 VEP_REQUEST_DELAY_SECONDS = float(os.environ.get("CARBONVEP_VEP_DELAY_SECONDS", "0.1"))
 ALPHAFOLD_MODEL_VERSIONS = ("v6", "v5", "v4", "v3", "v2", "v1")
@@ -2028,7 +2030,7 @@ def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, 
         if not slice_data.strip() or "_atom_site." not in slice_data:
             return {"success": False, "reason": "slice file does not look like a valid atom-containing mmCIF", "html": None}
 
-        view = py3Dmol.view(width=760, height=560)
+        view = py3Dmol.view(width=PROTEIN_VIEWER_WIDTH, height=PROTEIN_VIEWER_HEIGHT)
         view.addModel(slice_data, "cif")
         view.setStyle({}, {"cartoon": {"color": "#CECECE", "opacity": 0.8}})
         mutation_selection = {"resi": [target_residue]}
@@ -2546,7 +2548,7 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
                 structure_id = structure_result.get("pdb_id", "selected structure")
                 structure_source = structure_result.get("structure_source", "Structure")
                 st.success(f"Mapped {gene_name} residue {target_residue} on {structure_source} {structure_id}.")
-                components.html(structure_html, height=620, scrolling=False)
+                components.html(structure_html, height=PROTEIN_VIEWER_HEIGHT + 40, scrolling=False)
                 if structure_result.get("uniprot_id"):
                     st.write(f"UniProt ID: `{structure_result['uniprot_id']}`")
                 if structure_result.get("structure_source") or structure_result.get("pdb_id"):
