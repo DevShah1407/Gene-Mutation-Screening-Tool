@@ -1228,21 +1228,29 @@ def usage_logging_enabled():
     if env_value is not None:
         return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
 
+    secrets_obj = getattr(st, "secrets", {})
     try:
         value = st.secrets.get("enable_usage_logging", os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING", "false"))
-        if "enable_usage_logging" in st.secrets:
-            configured_value = st.secrets.get("enable_usage_logging")
-            return str(configured_value).strip().lower() in {"1", "true", "yes", "on"}
-
-        has_sheet = bool(
-            st.secrets.get("google_sheet_id", "")
-            or st.secrets.get("google_sheet_name", "")
-        )
-        has_service_account = "gcp_service_account" in st.secrets
+        has_logging_flag = "enable_usage_logging" in secrets_obj
     except Exception:
         value = os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING", "false")
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
-        return False
+        has_logging_flag = False
+    if has_logging_flag:
+        configured_value = secrets_obj.get("enable_usage_logging", "false")
+        return str(configured_value).strip().lower() in {"1", "true", "yes", "on"}
+
+    try:
+        has_sheet = bool(
+            secrets_obj.get("google_sheet_id", "")
+            or secrets_obj.get("google_sheet_name", "")
+        )
+    except Exception:
+        has_sheet = False
+    try:
+        has_service_account = "gcp_service_account" in secrets_obj
+    except Exception:
+        has_service_account = False
 
     return has_sheet and has_service_account
 
