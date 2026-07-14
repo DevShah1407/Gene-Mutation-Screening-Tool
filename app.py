@@ -67,6 +67,37 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 
+def patch_streamlit_watcher_for_transformers():
+    """Prevent Streamlit's source watcher from importing optional Transformers vision modules."""
+    try:
+        from streamlit.watcher import local_sources_watcher
+
+        if getattr(local_sources_watcher, "_carbonvep_transformers_patch", False):
+            return
+
+        original_get_module_paths = local_sources_watcher.get_module_paths
+        skipped_prefixes = ("transformers", "torchvision")
+
+        def safe_get_module_paths(module):
+            module_name = getattr(module, "__name__", "")
+            if module_name.startswith(skipped_prefixes):
+                return set()
+            try:
+                return original_get_module_paths(module)
+            except ModuleNotFoundError as exc:
+                if "torchvision" in str(exc):
+                    return set()
+                raise
+
+        local_sources_watcher.get_module_paths = safe_get_module_paths
+        local_sources_watcher._carbonvep_transformers_patch = True
+    except Exception:
+        pass
+
+
+patch_streamlit_watcher_for_transformers()
+
+
 MODEL_NAME = "HuggingFaceBio/Carbon-500M"
 CARBON_MODEL_REVISION = os.environ.get("CARBONVEP_MODEL_REVISION", "106e36ff51b5dfbfe0b078ad18ad37a6956c5714")
 PREVIEW_ROWS = 25
