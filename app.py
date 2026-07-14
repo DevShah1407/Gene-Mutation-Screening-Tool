@@ -8,6 +8,7 @@ one MAF upload and one button execute the same disk-based pipeline.
 import csv
 import gc
 import html
+import json
 import os
 import tempfile
 import time
@@ -68,6 +69,8 @@ import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+
+import carbonvep_core as core
 
 
 def patch_streamlit_watcher_for_transformers():
@@ -489,6 +492,46 @@ def app_log(message):
     st.session_state.setdefault("log_messages", []).append(str(message))
 
 
+def ensure_non_pii_session_id():
+    if "session_id" not in st.session_state:
+        st.session_state["session_id"] = core.generate_session_id()
+    return st.session_state["session_id"]
+
+
+def path_from_session(value):
+    return Path(value) if value else None
+
+
+def serialize_run_paths(paths):
+    st.session_state["current_run_paths"] = paths.to_jsonable()
+
+
+def get_current_run_paths():
+    data = st.session_state.get("current_run_paths")
+    if not data:
+        return None
+    return core.RunPaths(**{key: Path(value) if key.endswith("dir") or key.endswith("path") or key in {"maf", "vcf", "fasta", "carbon_csv", "mapped_csv", "vep_csv", "rejected_csv"} else value for key, value in data.items()})
+
+
+def new_run_paths():
+    paths = core.create_run_paths(RUN_DIR, ensure_non_pii_session_id())
+    serialize_run_paths(paths)
+    return paths
+
+
+def reset_current_run_state():
+    for key in [
+        "structure_result",
+        "assistant_messages",
+        "current_pipeline_message",
+        "reference_context_ready",
+        "run_status",
+        "stage_results",
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state["log_messages"] = []
+
+
 @contextmanager
 def timed_stage(stage_name):
     start = time.perf_counter()
@@ -528,32 +571,26 @@ def read_csv_safely(path, label):
 
 
 def request_with_retries(method, url, *, max_attempts=3, backoff_seconds=0.75, retry_statuses=None, **kwargs):
-    retry_statuses = retry_statuses or {429, 500, 502, 503, 504}
-    last_error = None
-    method = str(method).upper()
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.request(method, url, **kwargs)
-            if response.status_code in retry_statuses and attempt < max_attempts:
-                wait_time = backoff_seconds * (2 ** (attempt - 1))
-                app_log(f"{method} {url} returned HTTP {response.status_code}; retrying in {wait_time:.2f}s.")
-                time.sleep(wait_time)
-                continue
-            response.raise_for_status()
-            return response
-        except Exception as exc:
-            last_error = exc
-            if attempt >= max_attempts:
-                break
-            wait_time = backoff_seconds * (2 ** (attempt - 1))
-            app_log(f"{method} {url} failed on attempt {attempt}/{max_attempts}: {exc}; retrying in {wait_time:.2f}s.")
-            time.sleep(wait_time)
-    raise last_error
+    try:
+        return core.request_with_retries(
+            method,
+            url,
+            max_attempts=max_attempts,
+            backoff_seconds=backoff_seconds,
+            retry_statuses=retry_statuses,
+            **kwargs,
+        )
+    except Exception as exc:
+        app_log(f"{str(method).upper()} {core.sanitize_url(url)} failed: {exc}")
+        raise
 
 
 def request_json_with_retries(method, url, **kwargs):
-    response = request_with_retries(method, url, **kwargs)
-    return response.json()
+    try:
+        return core.request_json_with_retries(method, url, **kwargs)
+    except Exception as exc:
+        app_log(f"{str(method).upper()} {core.sanitize_url(url)} JSON request failed: {exc}")
+        raise
 
 
 def status_badge_html(status, text=None):
@@ -573,28 +610,31 @@ def render_status_badge(status, text=None):
     st.markdown(status_badge_html(status, text), unsafe_allow_html=True)
 
 
-def get_pipeline_stage_statuses(structure_result=None):
+def get_pipeline_stage_statuses(structure_result=None, paths=None):
     structure_result = structure_result or st.session_state.get("structure_result")
-    chromosome_plot_ready = any(RUN_DIR.glob("chrom_*_profile.png"))
+    paths = paths or get_current_run_paths()
+    if not paths:
+        return []
+    chromosome_plot_ready = any(paths.plot_dir.glob("chrom_*_profile.png"))
     cohort_plot_ready = all(
-        (RUN_DIR / filename).exists()
+        (paths.plot_dir / filename).exists()
         for filename in ["1_variant_score_distribution.png", "2_top_mutated_genes.png", "3_mutation_spectrum.png"]
     )
-    reference_ready = bool(st.session_state.get("reference_context_ready")) or CARBON_CSV.exists()
+    reference_ready = bool(st.session_state.get("reference_context_ready")) or paths.carbon_csv.exists()
     current_message = str(st.session_state.get("current_pipeline_message", "")).lower()
 
     stages = [
-        ("MAF Uploaded", MAF_PATH.exists(), "upload"),
-        ("MAF to VCF", VCF_PATH.exists(), "vcf"),
+        ("MAF Uploaded", paths.maf.exists(), "upload"),
+        ("MAF to VCF", paths.vcf.exists(), "vcf"),
         ("hg38 Reference Access", reference_ready, "genome"),
-        ("Context Extraction", CARBON_CSV.exists(), "context"),
-        ("Carbon Scoring", CARBON_CSV.exists(), "carbon"),
+        ("Context Extraction", paths.carbon_csv.exists(), "context"),
+        ("Carbon Scoring", paths.carbon_csv.exists(), "carbon"),
         ("Chromosome Plots", chromosome_plot_ready, "chromosome"),
-        ("UCSC Annotation", MAPPED_CSV.exists(), "ucsc"),
+        ("UCSC Annotation", paths.mapped_csv.exists(), "ucsc"),
         ("Cohort Plots", cohort_plot_ready, "cohort"),
-        ("VEP Annotation", VEP_CSV.exists(), "vep"),
+        ("VEP Annotation", paths.vep_csv.exists(), "vep"),
         ("Protein Mapping", bool(structure_result), "protein"),
-        ("Output Package", ZIP_PATH.exists(), "zip"),
+        ("Output Package", paths.zip_path.exists(), "zip"),
     ]
 
     running_map = {
@@ -636,9 +676,9 @@ def get_pipeline_stage_statuses(structure_result=None):
     return rendered
 
 
-def render_pipeline_status_badges(structure_result=None):
+def render_pipeline_status_badges(structure_result=None, paths=None):
     cards = []
-    for label, status, badge_text in get_pipeline_stage_statuses(structure_result):
+    for label, status, badge_text in get_pipeline_stage_statuses(structure_result, paths):
         cards.append(
             '<div class="carbon-status-card">'
             f'<span class="carbon-status-label">{html.escape(label)}</span>'
@@ -655,21 +695,11 @@ def get_score_profile_label(carbon_df):
     if scores.empty:
         return "not available", "Carbon scores could not be summarized because no numeric scores were available."
 
-    abs_scores = scores.abs()
-    median_abs = float(abs_scores.median())
-    high_fraction = float((abs_scores >= 2.0).mean())
-    moderate_fraction = float(((abs_scores >= 1.0) & (abs_scores < 2.0)).mean())
-
-    if high_fraction >= 0.35 or median_abs >= 2.0:
-        profile = "mostly high"
-    elif moderate_fraction + high_fraction >= 0.35 or median_abs >= 1.0:
-        profile = "moderate"
-    else:
-        profile = "mostly low"
-
+    profile = "within-run ranked"
+    median_abs = float(scores.abs().median())
     summary = (
-        f"The score distribution appears {profile}. The median absolute variant score is {median_abs:.3f}, "
-        f"with {high_fraction:.0%} of scored variants at or above an absolute score of 2.0."
+        f"The score distribution is cohort-relative within this uploaded run. The median absolute variant score is {median_abs:.3f}. "
+        "Use ranks and percentiles within this run rather than absolute clinical thresholds."
     )
     return profile, summary
 
@@ -744,9 +774,8 @@ def build_clinical_interpretation(carbon_df, mapped_df, vep_df, structure_result
     return {
         "profile": profile,
         "carbon": (
-            f"{score_summary} Carbon scores estimate the predicted functional impact of genomic variants using "
-            "a language model trained on genomic sequences. Higher absolute scores may indicate variants that "
-            "warrant further investigation but are not by themselves evidence of pathogenicity."
+            f"{score_summary} Carbon scores estimate relative sequence-model perturbation among the variants uploaded in this run. "
+            "Scores from separately normalized runs are not directly comparable unless an externally validated normalization is introduced."
         ),
         "genes": f"{top_gene_text} {highest_gene_text}{ttn_note}",
         "mutation": mutation_text,
@@ -757,8 +786,8 @@ def build_clinical_interpretation(carbon_df, mapped_df, vep_df, structure_result
 
 def render_clinical_interpretation(carbon_df, mapped_df, vep_df, structure_result):
     summary = build_clinical_interpretation(carbon_df, mapped_df, vep_df, structure_result)
-    st.markdown('<div class="carbon-section-title">Clinical Interpretation</div>', unsafe_allow_html=True)
-    st.caption("This section summarizes the generated outputs in plain English. It is not diagnostic.")
+    st.markdown('<div class="carbon-section-title">Research Summary</div>', unsafe_allow_html=True)
+    st.caption("This section summarizes the generated outputs in plain English for exploratory research use. It is not diagnostic.")
 
     st.markdown(
         f"""
@@ -796,7 +825,7 @@ def render_clinical_interpretation(carbon_df, mapped_df, vep_df, structure_resul
             </ul>
         </div>
         <div class="carbon-disclaimer">
-            This report is intended for research and educational purposes only. Carbon scores estimate predicted functional impact and should not be interpreted as evidence of pathogenicity or used alone for clinical decision-making.
+            This report is intended for research and educational purposes only. Carbon scores are cohort-relative within the uploaded run and should not be interpreted as evidence of pathogenicity or used for clinical decision-making.
         </div>
         """,
         unsafe_allow_html=True,
@@ -890,8 +919,8 @@ def answer_assistant_question(question, carbon_df, mapped_df, vep_df, structure_
 
 
 def render_ai_assistant(carbon_df, mapped_df, vep_df, structure_result):
-    st.markdown('<div class="carbon-section-title">AI Assistant</div>', unsafe_allow_html=True)
-    st.caption("Ask plain-English questions about the report, terminology, plots, or pipeline outputs. The assistant does not diagnose disease.")
+    st.markdown('<div class="carbon-section-title">Report Help</div>', unsafe_allow_html=True)
+    st.caption("Ask plain-English questions about the report, terminology, plots, or pipeline outputs. This is a rule-based explanation tool and does not diagnose disease.")
 
     examples = [
         "What is Carbon Score?",
@@ -919,8 +948,11 @@ def render_ai_assistant(carbon_df, mapped_df, vep_df, structure_result):
             st.markdown(answer)
 
 
-def render_live_outputs(live_box, stage_label="", structure_result=None):
+def render_live_outputs(live_box, stage_label="", structure_result=None, paths=None):
     if live_box is None:
+        return
+    paths = paths or get_current_run_paths()
+    if not paths:
         return
 
     with live_box.container():
@@ -928,33 +960,33 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
         st.markdown('<div class="carbon-section-title">Live Results</div>', unsafe_allow_html=True)
         if stage_label:
             st.caption(f"Latest completed step: {stage_label}")
-        render_pipeline_status_badges(structure_result)
+        render_pipeline_status_badges(structure_result, paths)
 
-        if CARBON_CSV.exists():
-            carbon_preview = read_csv_safely(CARBON_CSV, "live Carbon score preview")
+        if paths.carbon_csv.exists():
+            carbon_preview = read_csv_safely(paths.carbon_csv, "live Carbon score preview")
             if carbon_preview is not None:
                 st.markdown('<div class="carbon-section-title">Carbon Scores Available</div>', unsafe_allow_html=True)
                 st.dataframe(carbon_preview.head(10), width="stretch")
 
         live_cols = st.columns(2)
-        if MAPPED_CSV.exists():
-            mapped_preview = read_csv_safely(MAPPED_CSV, "live mapped variant preview")
+        if paths.mapped_csv.exists():
+            mapped_preview = read_csv_safely(paths.mapped_csv, "live mapped variant preview")
             if mapped_preview is not None:
                 with live_cols[0]:
                     st.markdown('<div class="carbon-section-title">Mapped Variants Available</div>', unsafe_allow_html=True)
                     st.dataframe(mapped_preview.head(8), width="stretch")
 
-        if VEP_CSV.exists():
-            vep_preview = read_csv_safely(VEP_CSV, "live VEP preview")
+        if paths.vep_csv.exists():
+            vep_preview = read_csv_safely(paths.vep_csv, "live VEP preview")
             if vep_preview is not None:
                 with live_cols[1]:
                     st.markdown('<div class="carbon-section-title">VEP Output Available</div>', unsafe_allow_html=True)
                     st.dataframe(vep_preview.head(8), width="stretch")
 
         live_plots = [
-            RUN_DIR / "1_variant_score_distribution.png",
-            RUN_DIR / "2_top_mutated_genes.png",
-            RUN_DIR / "3_mutation_spectrum.png",
+            paths.plot_dir / "1_variant_score_distribution.png",
+            paths.plot_dir / "2_top_mutated_genes.png",
+            paths.plot_dir / "3_mutation_spectrum.png",
         ]
         visible_live_plots = [plot for plot in live_plots if plot.exists()]
         if visible_live_plots:
@@ -976,16 +1008,7 @@ def render_live_outputs(live_box, stage_label="", structure_result=None):
 
 
 def chromosome_sort_key(chromosome):
-    value = str(chromosome).replace("chr", "").replace("CHR", "")
-    if value.isdigit():
-        return (0, int(value))
-    if value.upper() == "X":
-        return (1, 23)
-    if value.upper() == "Y":
-        return (1, 24)
-    if value.upper() in {"M", "MT"}:
-        return (1, 25)
-    return (2, value)
+    return core.chromosome_sort_key(chromosome)
 
 
 def get_chromosome_options(df):
@@ -1176,23 +1199,40 @@ def log_user_login(full_name, email, institution, role_grade, session_id, status
     )
 
 
+def usage_logging_enabled():
+    try:
+        value = st.secrets.get("enable_usage_logging", os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING", "false"))
+    except Exception:
+        value = os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING", "false")
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_valid_email(email):
+    email = str(email).strip()
+    return "@" in email and "." in email.rsplit("@", 1)[-1] and " " not in email
+
+
 def is_logged_in():
-    return bool(st.session_state.get("user_checkin"))
+    return bool(st.session_state.get("user_checkin")) or not usage_logging_enabled()
 
 
 def ensure_session_id():
-    if "session_id" not in st.session_state:
-        st.session_state["session_id"] = str(uuid.uuid4())
-    return st.session_state["session_id"]
+    return ensure_non_pii_session_id()
 
 
 def ensure_login():
     ensure_session_id()
+    if not usage_logging_enabled():
+        st.session_state.setdefault("user_checkin", {"session_id": st.session_state["session_id"], "logging": "disabled"})
+        return True
     if is_logged_in():
         return True
 
     st.title("User Check-In")
-    st.caption("Please enter your details before using CarbonVEP. This check-in is logged for usage tracking.")
+    st.caption(
+        "Usage logging is enabled for this deployment. Your name, email and organization will be sent to the configured "
+        "Google Sheet for access tracking only. Genomic data and uploaded filenames are not sent to Google Sheets."
+    )
 
     with st.form("user_checkin_form", clear_on_submit=False):
         full_name = st.text_input("Full name")
@@ -1204,6 +1244,9 @@ def ensure_login():
     if submitted:
         if not full_name.strip() or not email.strip() or not institution.strip():
             st.error("Full name, email address, and institution are required.")
+            st.stop()
+        if not is_valid_email(email):
+            st.error("Please enter a valid email address.")
             st.stop()
 
         user_data = {
@@ -1234,10 +1277,10 @@ def ensure_login():
     st.stop()
 
 
-def save_uploaded_maf(uploaded_file):
-    with open(MAF_PATH, "wb") as handle:
+def save_uploaded_maf(uploaded_file, paths):
+    with open(paths.maf, "wb") as handle:
         handle.write(uploaded_file.getbuffer())
-    return MAF_PATH
+    return paths.maf
 
 
 def convert_maf_to_vcf(maf_path, vcf_path):
@@ -1270,6 +1313,26 @@ def convert_maf_to_vcf(maf_path, vcf_path):
     return vcf_df
 
 
+def convert_validated_maf_to_vcf(validated_df, vcf_path):
+    app_log(f"Writing validated SNV VCF file to: {vcf_path}...")
+    vcf_df = pd.DataFrame()
+    vcf_df["#CHROM"] = validated_df["normalized_chromosome"].apply(lambda chrom: f"chr{chrom}" if not str(chrom).startswith("chr") else chrom)
+    vcf_df["POS"] = validated_df["normalized_position"].astype(int)
+    vcf_df["ID"] = "."
+    vcf_df["REF"] = validated_df["normalized_ref"]
+    vcf_df["ALT"] = validated_df["normalized_alt"]
+    vcf_df["QUAL"] = "."
+    vcf_df["FILTER"] = "PASS"
+    vcf_df["INFO"] = "."
+    vcf_df = vcf_df.sort_values(by=["#CHROM", "POS", "REF", "ALT"])
+    with open(vcf_path, "w") as f:
+        f.write("##fileformat=VCFv4.2\n")
+        f.write("##source=CarbonVEP_Streamlit_Validated_SNVs\n")
+        vcf_df.to_csv(f, sep="\t", index=False)
+    app_log(f"Validated VCF conversion complete with {len(vcf_df)} supported SNVs.")
+    return vcf_df
+
+
 def download_and_prepare_hg38():
     st.session_state["reference_context_ready"] = True
     app_log("hg38 reference access ready through the cached UCSC sequence API.")
@@ -1291,8 +1354,8 @@ def fetch_hg38_sequence(chrom, start, end):
     return dna
 
 
-def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
-    app_log("Fetching hg38 mutation contexts from UCSC sequence API...")
+def extract_mutation_context(vcf_path, fasta_path, context_window=200, rejected_path=None):
+    app_log("Fetching hg38 mutation contexts from UCSC sequence API for the direct Carbon scoring window...")
     df = pd.read_csv(
         vcf_path,
         sep="\t",
@@ -1302,24 +1365,33 @@ def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
 
     half_window = context_window // 2
     prepared_data = []
+    rejected_rows = []
     for _, row in df.iterrows():
         chrom = str(row["CHROM"])
         pos = int(row["POS"])
         ref = str(row["REF"])
         alt = str(row["ALT"])
-        start = max(0, pos - half_window)
+        start = max(0, pos - half_window - 1)
         end = pos + half_window
         try:
             wt_seq = fetch_hg38_sequence(chrom, start, end)
         except Exception as exc:
             app_log(f"Skipping {chrom}:{pos} because hg38 context could not be retrieved: {exc}")
+            rejected_rows.append({"chrom": chrom, "pos": pos, "ref": ref, "alt": alt, "rejection_reason": f"context_fetch_failed:{exc}"})
             continue
-        mutation_idx = pos - start - 1
+        mutation_idx = (pos - 1) - start
         if mutation_idx < 0 or mutation_idx >= len(wt_seq):
             app_log(
                 f"Skipping {chrom}:{pos} because the mutation index {mutation_idx} "
                 f"is outside the fetched context length {len(wt_seq)}."
             )
+            rejected_rows.append({"chrom": chrom, "pos": pos, "ref": ref, "alt": alt, "rejection_reason": "mutation_index_outside_context"})
+            continue
+        observed_ref = wt_seq[mutation_idx].upper()
+        if observed_ref != ref.upper():
+            reason = f"reference_mismatch:uploaded={ref.upper()};observed={observed_ref}"
+            app_log(f"Skipping {chrom}:{pos} because {reason}.")
+            rejected_rows.append({"chrom": chrom, "pos": pos, "ref": ref, "alt": alt, "observed_ref": observed_ref, "rejection_reason": reason})
             continue
         mut_seq = wt_seq[:mutation_idx] + alt + wt_seq[mutation_idx + 1 :]
         prepared_data.append(
@@ -1330,12 +1402,23 @@ def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
                 "alt": alt,
                 "wildtype_ctx": wt_seq,
                 "mutant_ctx": mut_seq,
+                "mutation_index": mutation_idx,
+                "reference_assembly": "hg38",
+                "sequence_backend": "UCSC getData sequence API",
             }
         )
 
+    if rejected_path and rejected_rows:
+        rejected_df = pd.DataFrame(rejected_rows)
+        rejected_file = Path(rejected_path)
+        if rejected_file.exists() and rejected_file.stat().st_size > 0:
+            existing = pd.read_csv(rejected_file)
+            rejected_df = pd.concat([existing, rejected_df], ignore_index=True, sort=False)
+        rejected_df.to_csv(rejected_file, index=False)
+
     app_log(f"Done! Successfully extracted contexts for {len(prepared_data)} variants.")
     if not prepared_data:
-        raise RuntimeError("No hg38 mutation contexts could be extracted. Check UCSC availability and input coordinates.")
+        raise RuntimeError("No hg38 mutation contexts could be extracted after reference-allele validation. See rejected_variants.csv.")
     return prepared_data
 
 
@@ -1363,7 +1446,7 @@ def load_carbon_model(model_name, hf_token):
             tokenizer_kwargs["use_auth_token"] = token
         tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
 
-    requested_dtype = os.environ.get("CARBONVEP_MODEL_DTYPE", "bfloat16").strip().lower()
+    requested_dtype = os.environ.get("CARBONVEP_MODEL_DTYPE", "float32").strip().lower()
     dtype_map = {
         "float16": torch.float16,
         "fp16": torch.float16,
@@ -1372,7 +1455,7 @@ def load_carbon_model(model_name, hf_token):
         "float32": torch.float32,
         "fp32": torch.float32,
     }
-    model_dtype = dtype_map.get(requested_dtype, torch.bfloat16)
+    model_dtype = dtype_map.get(requested_dtype, torch.float32)
     model_kwargs = {
         "trust_remote_code": True,
         "cache_dir": str(HF_CACHE_DIR),
@@ -1477,6 +1560,12 @@ def run_carbon_inference(dataset, output_csv, progress_callback=None):
                 "mutant_ctx": mut_full[max(0, mid_mut - WINDOW_BEFORE_AFTER) : mid_mut + WINDOW_BEFORE_AFTER],
             }
             res = evaluate_variant(sliced_variant, tokenizer, model)
+            res["model_name"] = MODEL_NAME
+            res["model_revision"] = CARBON_MODEL_REVISION
+            res["model_dtype"] = os.environ.get("CARBONVEP_MODEL_DTYPE", "float32").strip().lower()
+            res["reference_assembly"] = variant.get("reference_assembly", "hg38")
+            res["sequence_backend"] = variant.get("sequence_backend", "UCSC getData sequence API")
+            res["mutation_index"] = variant.get("mutation_index")
             raw_results.append(res)
             elapsed = max(time.perf_counter() - inference_start, 1e-9)
             throughput = (idx + 1) / elapsed
@@ -1494,7 +1583,21 @@ def run_carbon_inference(dataset, output_csv, progress_callback=None):
 
         app_log("Step 3: Compounding Z-Scores and Writing to CSV...")
         with open(output_csv, mode="w", newline="") as f:
-            fieldnames = ["chrom", "pos", "ref", "alt", "delta_log_prob", "l2_distance", "variant_score"]
+            fieldnames = [
+                "chrom",
+                "pos",
+                "ref",
+                "alt",
+                "delta_log_prob",
+                "l2_distance",
+                "variant_score",
+                "model_name",
+                "model_revision",
+                "model_dtype",
+                "reference_assembly",
+                "sequence_backend",
+                "mutation_index",
+            ]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for res in raw_results:
@@ -1511,10 +1614,12 @@ def run_carbon_inference(dataset, output_csv, progress_callback=None):
     return pd.DataFrame()
 
 
-def generate_chromosome_plots(csv_path):
+def generate_chromosome_plots(csv_path, plot_dir=None):
     import matplotlib.pyplot as plt
     import seaborn as sns
 
+    plot_dir = Path(plot_dir or Path(csv_path).parent)
+    plot_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(csv_path)
     sns.set_theme(
         style="whitegrid",
@@ -1560,7 +1665,7 @@ def generate_chromosome_plots(csv_path):
             ax.tick_params(axis="both", labelsize=10, colors="#475569")
             for spine in ax.spines.values():
                 spine.set_color("#d9e1ec")
-        output_filename = RUN_DIR / f"chrom_{chrom}_profile.png"
+        output_filename = plot_dir / f"chrom_{chrom}_profile.png"
         plt.tight_layout()
         plt.savefig(output_filename, dpi=300)
         plt.close()
@@ -1573,22 +1678,45 @@ def generate_chromosome_plots(csv_path):
 def identify_gene_via_ucsc(chrom, pos):
     chrom_str = str(chrom)
     chrom_fixed = chrom_str if chrom_str.lower().startswith("chr") else f"chr{chrom_str}"
+    pos = int(pos)
     url = "https://api.genome.ucsc.edu/getData/track"
     params = {
         "genome": "hg38",
         "track": "ncbiRefSeq",
         "chrom": chrom_fixed,
-        "start": int(pos) - 1000,
-        "end": int(pos) + 1000,
+        "start": max(0, pos - 1),
+        "end": pos,
     }
     try:
         data = request_json_with_retries("GET", url, params=params, timeout=8)
         items = data.get("ncbiRefSeq", [])
-        if items:
-            return items[0].get("name2", "Unknown Feature")
+        overlaps = [
+            item for item in items
+            if int(item.get("txStart", item.get("chromStart", pos))) <= pos - 1 < int(item.get("txEnd", item.get("chromEnd", pos)))
+        ]
+        if overlaps:
+            gene_symbols = sorted({item.get("name2", "Unknown Feature") for item in overlaps if item.get("name2")})
+            return {
+                "gene_symbol": gene_symbols[0] if gene_symbols else "Unknown Feature",
+                "annotation_status": "success",
+                "annotation_source": "UCSC ncbiRefSeq exact coordinate overlap",
+                "annotation_error": "",
+            }
+        return {
+            "gene_symbol": "Intergenic / Non-coding",
+            "annotation_status": "no_overlapping_feature",
+            "annotation_source": "UCSC ncbiRefSeq exact coordinate overlap",
+            "annotation_error": "",
+        }
     except Exception as exc:
         app_log(f"UCSC gene lookup failed for {chrom_fixed}:{pos}: {exc}")
-    return "Intergenic / Non-coding"
+        status = "rate_limited" if "429" in str(exc) else "service_error"
+        return {
+            "gene_symbol": "Annotation unavailable",
+            "annotation_status": status,
+            "annotation_source": "UCSC ncbiRefSeq exact coordinate overlap",
+            "annotation_error": str(exc),
+        }
 
 
 def map_carbon_variants_with_ucsc(file_path, output_file):
@@ -1598,7 +1726,8 @@ def map_carbon_variants_with_ucsc(file_path, output_file):
     for idx, row in df.iterrows():
         if idx % 50 == 0 and idx > 0:
             app_log(f" -> Processed {idx} out of {len(df)} variants...")
-        gene_symbol = identify_gene_via_ucsc(row["chrom"], row["pos"])
+        annotation = identify_gene_via_ucsc(row["chrom"], row["pos"])
+        gene_symbol = annotation["gene_symbol"]
         results.append(
             {
                 "chrom": row["chrom"],
@@ -1608,6 +1737,9 @@ def map_carbon_variants_with_ucsc(file_path, output_file):
                 "Mutation": f"{row['chrom']}:{row['pos']} ({row['ref']}->{row['alt']})",
                 "Variant Score": round(row["variant_score"], 4),
                 "Mapped Gene": gene_symbol,
+                "annotation_status": annotation["annotation_status"],
+                "annotation_source": annotation["annotation_source"],
+                "annotation_error": annotation["annotation_error"],
             }
         )
     summary_df = pd.DataFrame(results)
@@ -1616,10 +1748,12 @@ def map_carbon_variants_with_ucsc(file_path, output_file):
     return summary_df
 
 
-def generate_cohort_property_plots(file_path):
+def generate_cohort_property_plots(file_path, plot_dir=None):
     import matplotlib.pyplot as plt
     import seaborn as sns
 
+    plot_dir = Path(plot_dir or Path(file_path).parent)
+    plot_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(file_path)
     df["Mutation Type"] = df["ref"].astype(str) + " ➔ " + df["alt"].astype(str)
     sns.set_theme(
@@ -1650,7 +1784,7 @@ def generate_cohort_property_plots(file_path):
     for spine in ax.spines.values():
         spine.set_color("#d9e1ec")
     plt.tight_layout()
-    plt.savefig(RUN_DIR / "1_variant_score_distribution.png", dpi=300)
+    plt.savefig(plot_dir / "1_variant_score_distribution.png", dpi=300)
     plt.close()
 
     app_log("Generating Graph 2: Top Mutated Genes...")
@@ -1672,7 +1806,7 @@ def generate_cohort_property_plots(file_path):
         for spine in ax.spines.values():
             spine.set_color("#d9e1ec")
         plt.tight_layout()
-        plt.savefig(RUN_DIR / "2_top_mutated_genes.png", dpi=300)
+        plt.savefig(plot_dir / "2_top_mutated_genes.png", dpi=300)
         plt.close()
     else:
         app_log("Skipping Graph 2: No functional genes mapped in this dataset.")
@@ -1695,23 +1829,49 @@ def generate_cohort_property_plots(file_path):
         spine.set_color("#d9e1ec")
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(RUN_DIR / "3_mutation_spectrum.png", dpi=300)
+    plt.savefig(plot_dir / "3_mutation_spectrum.png", dpi=300)
     plt.close()
     app_log("All graphics successfully generated and saved as high-resolution PNGs in your directory!")
 
 
+def transcript_priority(tc):
+    terms = set(tc.get("consequence_terms", []))
+    is_protein_coding = tc.get("biotype") == "protein_coding" or tc.get("protein_id") or tc.get("protein_start")
+    is_mane = bool(tc.get("mane_select") or tc.get("mane_plus_clinical"))
+    is_canonical = str(tc.get("canonical", "")).upper() == "YES" or tc.get("canonical") == 1
+    if is_mane and is_protein_coding:
+        return 0
+    if is_canonical and is_protein_coding:
+        return 1
+    if is_protein_coding:
+        return 2
+    if terms:
+        return 3
+    return 4
+
+
 @st.cache_data(show_spinner=False, ttl=86400)
-def query_vep_grch37(chrom, pos, ref, alt, carbon_score):
+def query_vep_grch38(chrom, pos, ref, alt, carbon_score):
     chrom_clean = str(chrom).lower().replace("chr", "")
-    url = f"https://rest.ensembl.org/vep/human/region/{chrom_clean}:{pos}-{pos}/{alt}?"
+    start = int(pos)
+    end = start + max(len(str(ref)), 1) - 1
+    url = f"https://rest.ensembl.org/vep/human/region/{chrom_clean}:{start}-{end}/{alt}?"
     headers = {"Content-Type": "application/json"}
     output_row = {
         "Mutation": f"chr{chrom_clean}:{pos}",
+        "chrom": f"chr{chrom_clean}",
+        "pos": pos,
+        "ref": ref,
+        "alt": alt,
         "Real Mapped Target": "Intergenic / Non-coding",
         "Ensembl_Transcript": "N/A",
         "Protein_Position": "N/A",
         "Amino_Acid_Mutation": "N/A",
         "Carbon Score": carbon_score,
+        "vep_status": "not_started",
+        "vep_error": "",
+        "selected_transcript_rule": "none",
+        "all_consequences_json": "[]",
     }
     try:
         if VEP_REQUEST_DELAY_SECONDS > 0:
@@ -1719,13 +1879,8 @@ def query_vep_grch37(chrom, pos, ref, alt, carbon_score):
         results = request_json_with_retries("GET", url, headers=headers, timeout=12)
         if results:
             tc_list = results[0].get("transcript_consequences", [])
-            selected_tc = None
-            for tc in tc_list:
-                if "missense_variant" in tc.get("consequence_terms", []):
-                    selected_tc = tc
-                    break
-            if not selected_tc and tc_list:
-                selected_tc = tc_list[0]
+            output_row["all_consequences_json"] = json.dumps(tc_list)[:20000]
+            selected_tc = sorted(tc_list, key=transcript_priority)[0] if tc_list else None
             if selected_tc:
                 gene_symbol = selected_tc.get("gene_symbol", "Unknown")
                 transcript_id = selected_tc.get("transcript_id", "N/A")
@@ -1740,20 +1895,28 @@ def query_vep_grch37(chrom, pos, ref, alt, carbon_score):
                 output_row["Ensembl_Transcript"] = transcript_id
                 output_row["Protein_Position"] = protein_pos
                 output_row["Amino_Acid_Mutation"] = variant_str
+                output_row["vep_status"] = "success"
+                output_row["selected_transcript_rule"] = str(transcript_priority(selected_tc))
             elif "regulatory_feature_consequences" in results[0]:
                 rc_list = results[0]["regulatory_feature_consequences"]
                 reg_ids = [rc["regulatory_feature_id"] for rc in rc_list if "regulatory_feature_id" in rc]
                 if reg_ids:
                     output_row["Real Mapped Target"] = ", ".join(reg_ids[:2])
+                    output_row["vep_status"] = "success"
+                    output_row["all_consequences_json"] = json.dumps(rc_list)[:20000]
+            else:
+                output_row["vep_status"] = "intergenic_or_no_consequence"
     except Exception as e:
-        app_log(f"Error resolving mutation track at chr{chrom_clean}:{pos} -> {e}")
+        output_row["vep_status"] = "api_error"
+        output_row["vep_error"] = str(e)
+        app_log(f"Error resolving Ensembl GRCh38 VEP at chr{chrom_clean}:{pos} -> {e}")
     return output_row
 
 
 def run_vep_mapping(input_carbon_csv, output_vep_csv):
     app_log(f"Loading raw Carbon dataset: '{input_carbon_csv}'...")
     df = pd.read_csv(input_carbon_csv)
-    app_log(f"Processing {len(df)} variants via Ensembl GRCh37 REST nodes ({VEP_REQUEST_DELAY_SECONDS:.2f}s delay on uncached requests)...")
+    app_log(f"Processing {len(df)} variants via Ensembl GRCh38 REST nodes ({VEP_REQUEST_DELAY_SECONDS:.2f}s delay on uncached requests)...")
     mapped_rows = []
     for idx, row in df.iterrows():
         v_score = float(row.get("Variant Score", row.get("variant_score", 0.0)))
@@ -1761,11 +1924,26 @@ def run_vep_mapping(input_carbon_csv, output_vep_csv):
         pos = row.get("pos", row.get("Position"))
         ref = row.get("ref", row.get("Reference"))
         alt = row.get("alt", row.get("Alternative"))
-        enriched_data = query_vep_grch37(chrom, pos, ref, alt, v_score)
+        enriched_data = query_vep_grch38(chrom, pos, ref, alt, v_score)
         mapped_rows.append(enriched_data)
         if idx % 10 == 0 and idx > 0:
             app_log(f" -> Checkpoint: Completed parsing index entry {idx} of {len(df)}")
-    ordered_cols = ["Mutation", "Real Mapped Target", "Ensembl_Transcript", "Protein_Position", "Amino_Acid_Mutation", "Carbon Score"]
+    ordered_cols = [
+        "Mutation",
+        "Real Mapped Target",
+        "Ensembl_Transcript",
+        "Protein_Position",
+        "Amino_Acid_Mutation",
+        "Carbon Score",
+        "chrom",
+        "pos",
+        "ref",
+        "alt",
+        "vep_status",
+        "vep_error",
+        "selected_transcript_rule",
+        "all_consequences_json",
+    ]
     final_df = pd.DataFrame(mapped_rows)[ordered_cols]
     final_df.to_csv(output_vep_csv, index=False)
     app_log(f"[SUCCESS] Pipeline clean database layer written directly to -> '{output_vep_csv}'")
@@ -1860,24 +2038,28 @@ def get_pdb_ids(uniprot_id):
     return []
 
 
-def retrieve_pdb_mmcif(pdb_id):
+def retrieve_pdb_mmcif(pdb_id, structure_dir=None):
     from Bio.PDB import PDBList
 
+    structure_dir = Path(structure_dir or PDB_DIR)
+    structure_dir.mkdir(parents=True, exist_ok=True)
     pdbl = PDBList()
-    expected = PDB_DIR / f"{pdb_id.lower()}.cif"
+    expected = structure_dir / f"{pdb_id.lower()}.cif"
     if expected.exists():
         app_log(f"Using local mmCIF: {expected}")
         return str(expected)
-    filename = pdbl.retrieve_pdb_file(pdb_id, pdir=str(PDB_DIR), file_format="mmCif")
+    filename = pdbl.retrieve_pdb_file(pdb_id, pdir=str(structure_dir), file_format="mmCif")
     app_log(f"Downloaded to: {filename}")
     return filename
 
 
-def retrieve_alphafold_mmcif(uniprot_id):
+def retrieve_alphafold_mmcif(uniprot_id, structure_dir=None):
     safe_uniprot = str(uniprot_id).strip()
     if not safe_uniprot:
         return None
-    expected = PDB_DIR / f"af_{safe_uniprot.lower()}_model.cif"
+    structure_dir = Path(structure_dir or PDB_DIR)
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    expected = structure_dir / f"af_{safe_uniprot.lower()}_model.cif"
     if expected.exists() and get_file_size(expected):
         app_log(f"Using local AlphaFold mmCIF: {expected}")
         return str(expected)
@@ -1982,7 +2164,7 @@ def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_
                     res_num = residue.id[1]
                     if res_num == target_residue:
                         for atom in residue:
-                            atom.set_bfactor(float(carbon_score))
+                            atom.set_bfactor(max(0.0, abs(float(carbon_score))))
                             modified_atoms += 1
         if modified_atoms > 0:
             from Bio.PDB import MMCIFIO
@@ -1990,6 +2172,18 @@ def inject_carbon_score_safely(cif_folder, cif_filename, target_residue, carbon_
             io = MMCIFIO()
             io.set_structure(structure)
             io.save(output_path)
+            metadata_path = Path(output_path).with_suffix(".carbon_score.json")
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "raw_carbon_score": float(carbon_score),
+                        "visual_bfactor_transform": "abs(raw_carbon_score)",
+                        "target_residue": target_residue,
+                        "mapped_atoms": modified_atoms,
+                    },
+                    indent=2,
+                )
+            )
             app_log(f"Success! Mapped Carbon Score ({carbon_score}) to residue {target_residue} across {modified_atoms} atoms.")
             app_log(f"Saved -> {output_path}")
             return output_path
@@ -2133,6 +2327,7 @@ def try_structure_candidate(
     carbon_score,
     amino_acid_mutation,
     skipped,
+    structure_dir=None,
 ):
     app_log(
         f"Trying structure candidate: source={source_label}, gene={gene_name}, "
@@ -2150,7 +2345,8 @@ def try_structure_candidate(
         app_log(reason)
         return None
 
-    output_slice_cif = PDB_DIR / f"{safe_structure_label(structure_id)}_variant_slice.cif"
+    structure_dir = Path(structure_dir or PDB_DIR)
+    output_slice_cif = structure_dir / f"{safe_structure_label(structure_id)}_variant_slice.cif"
     slice_result = create_variant_slice(mapped_file_path, str(output_slice_cif), target_residue)
     if not slice_result.get("success"):
         reason = f"{gene_name} ({uniprot_id}, {source_label} {structure_id}): {slice_result.get('reason', 'slice creation failed')}"
@@ -2191,7 +2387,9 @@ def try_structure_candidate(
     }
 
 
-def run_structure_mapping(vep_csv):
+def run_structure_mapping(vep_csv, paths=None):
+    structure_dir = Path(paths.structure_dir if paths else PDB_DIR)
+    structure_dir.mkdir(parents=True, exist_ok=True)
     try:
         vep_df = pd.read_csv(vep_csv)
     except Exception as exc:
@@ -2268,7 +2466,7 @@ def run_structure_mapping(vep_csv):
 
         for pdb_id in limited_pdb_ids:
             try:
-                cif_path = Path(retrieve_pdb_mmcif(pdb_id))
+                cif_path = Path(retrieve_pdb_mmcif(pdb_id, structure_dir))
                 result = try_structure_candidate(
                     gene_name,
                     uniprot_id,
@@ -2279,6 +2477,7 @@ def run_structure_mapping(vep_csv):
                     carbon_score,
                     amino_acid_mutation,
                     skipped,
+                    structure_dir,
                 )
                 if result:
                     return result
@@ -2289,7 +2488,7 @@ def run_structure_mapping(vep_csv):
                 continue
 
         try:
-            alphafold_cif = retrieve_alphafold_mmcif(uniprot_id)
+            alphafold_cif = retrieve_alphafold_mmcif(uniprot_id, structure_dir)
             if not alphafold_cif:
                 reason = f"{gene_name} ({uniprot_id}): no usable AlphaFold mmCIF fallback was available"
                 skipped.append(reason)
@@ -2305,6 +2504,7 @@ def run_structure_mapping(vep_csv):
                 carbon_score,
                 amino_acid_mutation,
                 skipped,
+                structure_dir,
             )
             if result:
                 return result
@@ -2319,21 +2519,18 @@ def run_structure_mapping(vep_csv):
     return make_skipped_structure_result(message, skipped)
 
 
-def collect_output_files():
-    patterns = [
-        "glioma_mutations.vcf",
-        "carbon_variant_scores.csv",
-        "mapped_carbon_variants.csv",
-        "vep_mapped_output.csv",
-        "chrom_*_profile.png",
-        "1_variant_score_distribution.png",
-        "2_top_mutated_genes.png",
-        "3_mutation_spectrum.png",
-        "pdb_files/*.cif",
+def collect_output_files(paths):
+    files = [
+        paths.vcf,
+        paths.carbon_csv,
+        paths.mapped_csv,
+        paths.vep_csv,
+        paths.rejected_csv,
+        paths.manifest_path,
     ]
-    files = []
-    for pattern in patterns:
-        files.extend(RUN_DIR.glob(pattern))
+    files.extend(paths.plot_dir.glob("*.png"))
+    files.extend(paths.structure_dir.glob("*.cif"))
+    files.extend(paths.structure_dir.glob("*.json"))
     safe_files = []
     for path in files:
         if not path.exists() or not path.is_file():
@@ -2346,26 +2543,26 @@ def collect_output_files():
     return safe_files
 
 
-def create_outputs_zip():
-    files = collect_output_files()
-    with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+def create_outputs_zip(paths):
+    files = collect_output_files(paths)
+    with zipfile.ZipFile(paths.zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in files:
-            zf.write(path, arcname=str(path.relative_to(RUN_DIR)))
-    return ZIP_PATH
+            zf.write(path, arcname=str(path.relative_to(paths.run_dir)))
+    return paths.zip_path
 
 
-def run_structure_mapping_nonfatal(vep_csv):
+def run_structure_mapping_nonfatal(vep_csv, paths=None):
     try:
-        return run_structure_mapping(vep_csv)
-    except BaseException as exc:
+        return run_structure_mapping(vep_csv, paths)
+    except Exception as exc:
         message = f"Protein structure mapping skipped after a protected late-stage failure: {exc}"
         app_log(message)
         return make_skipped_structure_result(message, [message])
 
 
-def create_outputs_zip_nonfatal():
+def create_outputs_zip_nonfatal(paths):
     try:
-        return create_outputs_zip()
+        return create_outputs_zip(paths)
     except Exception as exc:
         app_log(f"Output ZIP creation skipped: {exc}")
         return None
@@ -2373,10 +2570,25 @@ def create_outputs_zip_nonfatal():
 
 def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
     pipeline_start = time.perf_counter()
-    st.session_state["log_messages"] = []
+    reset_current_run_state()
+    core.safe_cleanup_abandoned_runs(RUN_DIR, max_age_hours=int(os.environ.get("CARBONVEP_RUN_RETENTION_HOURS", "24")))
+    paths = new_run_paths()
+    stage_results = []
+    st.session_state["stage_results"] = stage_results
+    st.session_state["run_status"] = "running"
+    input_hash = None
+
+    def begin_stage(name):
+        stage = core.StageResult(name).start()
+        stage_results.append(stage)
+        return stage
+
     with timed_stage("Upload handling"):
-        save_uploaded_maf(uploaded_file)
-    if st.session_state.get("user_checkin"):
+        stage = begin_stage("Upload handling")
+        save_uploaded_maf(uploaded_file, paths)
+        input_hash = core.file_sha256(paths.maf)
+        stage.finish("success", [paths.maf])
+    if usage_logging_enabled() and st.session_state.get("user_checkin"):
         user = st.session_state["user_checkin"]
         try:
             log_user_login(
@@ -2385,7 +2597,7 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
                 user["institution"],
                 user["role_grade"],
                 user["session_id"],
-                status=f"Analysis started: {uploaded_file.name}",
+                status="Analysis started",
             )
         except Exception as exc:
             app_log(f"Google Sheets analysis logging failed: {exc}")
@@ -2416,19 +2628,32 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
         app_log(message)
 
     update(0, "Upload complete")
-    render_live_outputs(live_box, "Upload complete")
-    update(1, "Converting MAF to VCF")
-    with timed_stage("MAF to VCF conversion"):
-        convert_maf_to_vcf(MAF_PATH, VCF_PATH)
-    render_live_outputs(live_box, "glioma_mutations.vcf ready")
+    render_live_outputs(live_box, "Upload complete", paths=paths)
+    update(1, "Validating uploaded MAF and converting supported SNVs to VCF")
+    with timed_stage("MAF validation and VCF conversion"):
+        stage = begin_stage("MAF validation and VCF conversion")
+        validated_df = core.read_and_validate_maf(
+            paths.maf,
+            rejected_path=paths.rejected_csv,
+            max_upload_mb=int(os.environ.get("CARBONVEP_MAX_UPLOAD_MB", "50")),
+            max_variants=int(os.environ.get("CARBONVEP_MAX_VARIANTS", "500")),
+            assembly="hg38",
+        )
+        convert_validated_maf_to_vcf(validated_df, paths.vcf)
+        stage.finish("success", [paths.vcf, paths.rejected_csv])
+    render_live_outputs(live_box, "glioma_mutations.vcf ready", paths=paths)
     update(2, "Preparing hg38 reference access")
     with timed_stage("hg38 reference access"):
+        stage = begin_stage("hg38 reference access")
         download_and_prepare_hg38()
-    render_live_outputs(live_box, "hg38 reference access ready")
+        stage.finish("success")
+    render_live_outputs(live_box, "hg38 reference access ready", paths=paths)
     update(3, "Extracting mutation contexts")
     with timed_stage("Context extraction"):
-        dataset = extract_mutation_context(VCF_PATH, FASTA_PATH)
-    render_live_outputs(live_box, "Mutation contexts extracted")
+        stage = begin_stage("Context extraction")
+        dataset = extract_mutation_context(paths.vcf, paths.fasta, rejected_path=paths.rejected_csv)
+        stage.finish("success", [paths.rejected_csv])
+    render_live_outputs(live_box, "Mutation contexts extracted", paths=paths)
     update(4, "Running Carbon-500M inference")
 
     def inference_progress(done, total, chrom, pos, throughput):
@@ -2438,35 +2663,68 @@ def run_full_pipeline(uploaded_file, progress_bar, status_box, live_box=None):
         status_box.write(message)
 
     with timed_stage("Carbon inference"):
-        run_carbon_inference(dataset, CARBON_CSV, progress_callback=inference_progress)
+        stage = begin_stage("Carbon inference")
+        run_carbon_inference(dataset, paths.carbon_csv, progress_callback=inference_progress)
+        stage.finish("success", [paths.carbon_csv])
     dataset = None
-    release_carbon_model_memory()
-    render_live_outputs(live_box, "carbon_variant_scores.csv ready")
+    render_live_outputs(live_box, "carbon_variant_scores.csv ready", paths=paths)
     update(5, "Generating chromosome profile plots")
     with timed_stage("Chromosome plot generation"):
-        generate_chromosome_plots(CARBON_CSV)
-    render_live_outputs(live_box, "Chromosome plots ready")
+        stage = begin_stage("Chromosome plot generation")
+        generate_chromosome_plots(paths.carbon_csv, paths.plot_dir)
+        stage.finish("success", list(paths.plot_dir.glob("chrom_*_profile.png")))
+    render_live_outputs(live_box, "Chromosome plots ready", paths=paths)
     update(6, "Mapping variants with UCSC")
     with timed_stage("UCSC annotation"):
-        map_carbon_variants_with_ucsc(CARBON_CSV, MAPPED_CSV)
-    render_live_outputs(live_box, "mapped_carbon_variants.csv ready")
+        stage = begin_stage("UCSC annotation")
+        map_carbon_variants_with_ucsc(paths.carbon_csv, paths.mapped_csv)
+        stage.finish("success", [paths.mapped_csv])
+    render_live_outputs(live_box, "mapped_carbon_variants.csv ready", paths=paths)
     update(7, "Generating cohort summary plots")
     with timed_stage("Cohort plot generation"):
-        generate_cohort_property_plots(MAPPED_CSV)
-    render_live_outputs(live_box, "Cohort plots ready")
+        stage = begin_stage("Cohort plot generation")
+        generate_cohort_property_plots(paths.mapped_csv, paths.plot_dir)
+        stage.finish("success", list(paths.plot_dir.glob("*.png")))
+    render_live_outputs(live_box, "Cohort plots ready", paths=paths)
     update(8, "Running Ensembl VEP mapping")
     with timed_stage("VEP mapping"):
-        run_vep_mapping(MAPPED_CSV, VEP_CSV)
-    render_live_outputs(live_box, "vep_mapped_output.csv ready")
+        stage = begin_stage("VEP mapping")
+        run_vep_mapping(paths.mapped_csv, paths.vep_csv)
+        stage.finish("success", [paths.vep_csv])
+    render_live_outputs(live_box, "vep_mapped_output.csv ready", paths=paths)
     update(9, "Mapping Carbon score into protein structure")
     with timed_stage("Structure mapping"):
-        structure_result = run_structure_mapping_nonfatal(VEP_CSV)
-    render_live_outputs(live_box, "Protein structure step complete", structure_result=structure_result)
+        stage = begin_stage("Structure mapping")
+        structure_result = run_structure_mapping_nonfatal(paths.vep_csv, paths)
+        stage_status = "skipped" if structure_result.get("skipped") else "success"
+        if structure_result.get("skipped"):
+            stage.warnings.extend(structure_result.get("skipped_details", []))
+        stage.finish(stage_status, [Path(structure_result["mapped_file"])] if structure_result.get("mapped_file") else [])
+    render_live_outputs(live_box, "Protein structure step complete", structure_result=structure_result, paths=paths)
     update(10, "Creating output ZIP")
     with timed_stage("ZIP creation"):
-        create_outputs_zip_nonfatal()
-    render_live_outputs(live_box, "Output package ready", structure_result=structure_result)
+        stage = begin_stage("ZIP creation")
+        core.write_run_manifest(
+            paths,
+            input_hash=input_hash,
+            model_name=MODEL_NAME,
+            model_revision=CARBON_MODEL_REVISION,
+            dtype=os.environ.get("CARBONVEP_MODEL_DTYPE", "float32").strip().lower(),
+            assembly="hg38",
+            sequence_backend="UCSC getData sequence API",
+            stage_results=stage_results,
+            generated_files=collect_output_files(paths),
+            warnings=[],
+        )
+        zip_result = create_outputs_zip_nonfatal(paths)
+        if zip_result and Path(zip_result).exists():
+            stage.finish("success", [zip_result, paths.manifest_path])
+            render_live_outputs(live_box, "Output package ready", structure_result=structure_result, paths=paths)
+        else:
+            stage.fail("ZIP creation failed")
+            render_live_outputs(live_box, "Output package skipped", structure_result=structure_result, paths=paths)
     update(11, "Analysis finished")
+    st.session_state["run_status"] = "complete_with_warnings" if structure_result.get("skipped") else "complete"
     app_log(f"[TIMER] Full pipeline completed in {time.perf_counter() - pipeline_start:.2f}s.")
     return structure_result
 
@@ -2487,25 +2745,31 @@ if run_clicked and uploaded_maf is not None:
         with st.spinner("Running full CarbonVEP pipeline..."):
             structure_result = run_full_pipeline(uploaded_maf, progress_bar, status_box, live_results_box)
         st.session_state["structure_result"] = structure_result
-        st.success("CarbonVEP analysis complete.")
+        if st.session_state.get("run_status") == "complete_with_warnings":
+            st.warning("CarbonVEP analysis completed with warnings. Review the run log and protein mapping details.")
+        else:
+            st.success("CarbonVEP analysis complete.")
     except Exception as exc:
+        st.session_state["run_status"] = "failed"
         st.error(f"Pipeline failed: {exc}")
         app_log(f"Pipeline failed: {exc}")
 
 show_log()
 
-if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
-    st.header("Results Dashboard")
-    st.caption("Pipeline outputs are written to disk using the original CarbonVEP filenames and displayed here for review.")
+current_paths = get_current_run_paths()
 
-    carbon_df = read_csv_safely(CARBON_CSV, "Carbon scores") if CARBON_CSV.exists() else None
-    mapped_df = read_csv_safely(MAPPED_CSV, "mapped variants") if MAPPED_CSV.exists() else None
-    vep_df = read_csv_safely(VEP_CSV, "VEP output") if VEP_CSV.exists() else None
+if current_paths and (current_paths.carbon_csv.exists() or current_paths.mapped_csv.exists() or current_paths.vep_csv.exists()):
+    st.header("Results Dashboard")
+    st.caption("Pipeline outputs are written to an isolated run directory using the original CarbonVEP filenames and displayed here for review.")
+
+    carbon_df = read_csv_safely(current_paths.carbon_csv, "Carbon scores") if current_paths.carbon_csv.exists() else None
+    mapped_df = read_csv_safely(current_paths.mapped_csv, "mapped variants") if current_paths.mapped_csv.exists() else None
+    vep_df = read_csv_safely(current_paths.vep_csv, "VEP output") if current_paths.vep_csv.exists() else None
 
     variant_count = 0
-    if VCF_PATH.exists():
+    if current_paths.vcf.exists():
         try:
-            with open(VCF_PATH) as handle:
+            with open(current_paths.vcf) as handle:
                 variant_count = sum(1 for line in handle if not line.startswith("#"))
         except Exception as exc:
             app_log(f"Could not count VCF variants: {exc}")
@@ -2520,7 +2784,7 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
         summary_cols[2].metric("Max Carbon score", "N/A")
         summary_cols[3].metric("Min Carbon score", "N/A")
 
-    render_pipeline_status_badges(st.session_state.get("structure_result"))
+    render_pipeline_status_badges(st.session_state.get("structure_result"), current_paths)
 
     chromosome_options = get_chromosome_options(carbon_df)
     selected_filter_chrom = "All chromosomes"
@@ -2533,15 +2797,15 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
                 index=0,
             )
 
-    tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads", "Clinical Interpretation", "AI Assistant"])
+    tabs = st.tabs(["Overview", "Chromosomes", "Mapped Variants", "VEP", "Protein View", "Downloads", "Research Summary", "Report Help"])
 
     cohort_plots = [
-        RUN_DIR / "1_variant_score_distribution.png",
-        RUN_DIR / "2_top_mutated_genes.png",
-        RUN_DIR / "3_mutation_spectrum.png",
+        current_paths.plot_dir / "1_variant_score_distribution.png",
+        current_paths.plot_dir / "2_top_mutated_genes.png",
+        current_paths.plot_dir / "3_mutation_spectrum.png",
     ]
     visible_cohort_plots = [plot for plot in cohort_plots if plot.exists()]
-    chromosome_plots = sorted(RUN_DIR.glob("chrom_*_profile.png"), key=lambda p: chromosome_sort_key(p.name.replace("chrom_", "").replace("_profile.png", "")))
+    chromosome_plots = sorted(current_paths.plot_dir.glob("chrom_*_profile.png"), key=lambda p: chromosome_sort_key(p.name.replace("chrom_", "").replace("_profile.png", "")))
 
     with tabs[0]:
         st.markdown('<div class="carbon-section-title">Cohort Summary</div>', unsafe_allow_html=True)
@@ -2637,20 +2901,20 @@ if CARBON_CSV.exists() or MAPPED_CSV.exists() or VEP_CSV.exists():
     with tabs[5]:
         st.markdown('<div class="carbon-section-title">Pipeline Output Package</div>', unsafe_allow_html=True)
         st.caption("This is a direct ZIP of the files written by the pipeline, with no schema rewriting.")
-        if ZIP_PATH.exists():
-            zip_size = get_file_size(ZIP_PATH)
-            st.write(f"Output package: `{ZIP_PATH.name}` ({format_bytes(zip_size)})")
+        if current_paths.zip_path.exists():
+            zip_size = get_file_size(current_paths.zip_path)
+            st.write(f"Output package: `{current_paths.zip_path.name}` ({format_bytes(zip_size)})")
             if zip_size and zip_size > MAX_INLINE_DOWNLOAD_BYTES:
                 st.warning(
                     "The output ZIP is too large to safely load into Streamlit's in-memory download widget. "
-                    f"The file was still written to disk at `{ZIP_PATH}`."
+                    f"The file was still written to disk at `{current_paths.zip_path}`."
                 )
             else:
-                with open(ZIP_PATH, "rb") as zip_file:
+                with open(current_paths.zip_path, "rb") as zip_file:
                     st.download_button(
                         "Download all CarbonVEP outputs as ZIP",
                         zip_file,
-                        file_name=ZIP_PATH.name,
+                        file_name=current_paths.zip_path.name,
                         mime="application/zip",
                     )
         else:
