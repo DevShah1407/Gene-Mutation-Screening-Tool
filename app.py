@@ -59,6 +59,9 @@ HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 import numpy as np
 import pandas as pd
@@ -1040,6 +1043,12 @@ def get_hf_token():
             token = st.secrets.get(secret_name, "")
             if token:
                 return str(token).strip()
+        for section_name in ("hf", "huggingface", "hugging_face"):
+            section = st.secrets.get(section_name, {})
+            if hasattr(section, "get"):
+                token = section.get("token", "") or section.get("HF_TOKEN", "")
+                if token:
+                    return str(token).strip()
     except Exception:
         pass
     for env_name in ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HF_HUB_TOKEN"):
@@ -1047,6 +1056,13 @@ def get_hf_token():
         if token:
             return token.strip()
     return ""
+
+
+def configure_hf_token(hf_token):
+    if not hf_token:
+        return
+    for env_name in ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HF_HUB_TOKEN"):
+        os.environ[env_name] = hf_token
 
 
 def normalize_service_account_info(credentials_info):
@@ -1325,21 +1341,28 @@ def extract_mutation_context(vcf_path, fasta_path, context_window=131072):
 
 @st.cache_resource(show_spinner=False)
 def load_carbon_model(model_name, hf_token):
+    configure_hf_token(hf_token)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import torch
 
     torch.set_num_threads(max(1, int(os.environ.get("CARBONVEP_TORCH_THREADS", "1"))))
-    if hf_token:
-        os.environ["HF_TOKEN"] = hf_token
 
     model_load_start = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        cache_dir=str(HF_CACHE_DIR),
-        revision=CARBON_MODEL_REVISION,
-        token=hf_token or None,
-    )
+    tokenizer_kwargs = {
+        "trust_remote_code": True,
+        "cache_dir": str(HF_CACHE_DIR),
+        "revision": CARBON_MODEL_REVISION,
+    }
+    if hf_token:
+        tokenizer_kwargs["token"] = hf_token
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
+    except TypeError:
+        token = tokenizer_kwargs.pop("token", None)
+        if token:
+            tokenizer_kwargs["use_auth_token"] = token
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
+
     requested_dtype = os.environ.get("CARBONVEP_MODEL_DTYPE", "bfloat16").strip().lower()
     dtype_map = {
         "float16": torch.float16,
@@ -1354,19 +1377,24 @@ def load_carbon_model(model_name, hf_token):
         "trust_remote_code": True,
         "cache_dir": str(HF_CACHE_DIR),
         "revision": CARBON_MODEL_REVISION,
-        "token": hf_token or None,
         "dtype": model_dtype,
         "low_cpu_mem_usage": True,
         "use_safetensors": True,
     }
+    if hf_token:
+        model_kwargs["token"] = hf_token
     app_log(f"Loading Carbon model revision={CARBON_MODEL_REVISION} with dtype={model_dtype} and low-memory CPU settings.")
     try:
         model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     except TypeError:
-        model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
-        model_kwargs.pop("low_cpu_mem_usage", None)
-        model_kwargs.pop("use_safetensors", None)
-        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        fallback_kwargs = dict(model_kwargs)
+        fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
+        fallback_kwargs.pop("low_cpu_mem_usage", None)
+        fallback_kwargs.pop("use_safetensors", None)
+        token = fallback_kwargs.pop("token", None)
+        if token:
+            fallback_kwargs["use_auth_token"] = token
+        model = AutoModelForCausalLM.from_pretrained(model_name, **fallback_kwargs)
     model = model.to("cpu").eval()
     app_log(f"[TIMER] Carbon model load completed in {time.perf_counter() - model_load_start:.2f}s.")
     return tokenizer, model
