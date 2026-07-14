@@ -1227,17 +1227,24 @@ def usage_logging_enabled():
     env_value = os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING")
     if env_value is not None:
         return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
+
     try:
         value = st.secrets.get("enable_usage_logging", os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING", "false"))
         if "enable_usage_logging" in st.secrets:
-            return str(st.secrets.get("enable_usage_logging")).strip().lower() in {"1", "true", "yes", "on"}
-        has_sheet = bool(st.secrets.get("google_sheet_id", "") or st.secrets.get("google_sheet_name", ""))
+            configured_value = st.secrets.get("enable_usage_logging")
+            return str(configured_value).strip().lower() in {"1", "true", "yes", "on"}
+
+        has_sheet = bool(
+            st.secrets.get("google_sheet_id", "")
+            or st.secrets.get("google_sheet_name", "")
+        )
         has_service_account = "gcp_service_account" in st.secrets
-        return has_sheet and has_service_account
     except Exception:
         value = os.environ.get("CARBONVEP_ENABLE_USAGE_LOGGING", "false")
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
         return False
+
+    return has_sheet and has_service_account
 
 
 def is_valid_email(email):
