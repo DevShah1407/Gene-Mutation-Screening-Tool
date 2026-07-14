@@ -532,6 +532,24 @@ def reset_current_run_state():
     st.session_state["log_messages"] = []
 
 
+def uploaded_file_signature(uploaded_file):
+    if uploaded_file is None:
+        return None
+    size = getattr(uploaded_file, "size", None)
+    return f"{uploaded_file.name}:{size}"
+
+
+def reset_display_for_new_upload(uploaded_file):
+    signature = uploaded_file_signature(uploaded_file)
+    if not signature:
+        return
+    previous_signature = st.session_state.get("last_uploaded_signature")
+    if previous_signature and previous_signature != signature:
+        reset_current_run_state()
+        st.session_state.pop("current_run_paths", None)
+    st.session_state["last_uploaded_signature"] = signature
+
+
 @contextmanager
 def timed_stage(stage_name):
     start = time.perf_counter()
@@ -1213,7 +1231,7 @@ def is_valid_email(email):
 
 
 def is_logged_in():
-    return bool(st.session_state.get("user_checkin")) or not usage_logging_enabled()
+    return bool(st.session_state.get("user_checkin"))
 
 
 def ensure_session_id():
@@ -1222,17 +1240,20 @@ def ensure_session_id():
 
 def ensure_login():
     ensure_session_id()
-    if not usage_logging_enabled():
-        st.session_state.setdefault("user_checkin", {"session_id": st.session_state["session_id"], "logging": "disabled"})
-        return True
     if is_logged_in():
         return True
 
     st.title("User Check-In")
-    st.caption(
-        "Usage logging is enabled for this deployment. Your name, email and organization will be sent to the configured "
-        "Google Sheet for access tracking only. Genomic data and uploaded filenames are not sent to Google Sheets."
-    )
+    if usage_logging_enabled():
+        st.caption(
+            "Usage logging is enabled for this deployment. Your name, email and organization will be sent to the configured "
+            "Google Sheet for access tracking only. Genomic data and uploaded filenames are not sent to Google Sheets."
+        )
+    else:
+        st.caption(
+            "Please enter your details before using CarbonVEP. Usage logging is currently disabled, so this check-in is stored "
+            "only in this Streamlit session and is not sent to Google Sheets."
+        )
 
     with st.form("user_checkin_form", clear_on_submit=False):
         full_name = st.text_input("Full name")
@@ -1257,19 +1278,20 @@ def ensure_login():
             "session_id": st.session_state["session_id"],
         }
 
-        try:
-            log_user_login(
-                user_data["full_name"],
-                user_data["email"],
-                user_data["institution"],
-                user_data["role_grade"],
-                user_data["session_id"],
-                status="Login",
-            )
-        except Exception as exc:
-            app_log(f"Google Sheets check-in failed: {exc}")
-            st.error("Could not log check-in to Google Sheets. Please verify the Streamlit secrets and sheet sharing, then try again.")
-            st.stop()
+        if usage_logging_enabled():
+            try:
+                log_user_login(
+                    user_data["full_name"],
+                    user_data["email"],
+                    user_data["institution"],
+                    user_data["role_grade"],
+                    user_data["session_id"],
+                    status="Login",
+                )
+            except Exception as exc:
+                app_log(f"Google Sheets check-in failed: {exc}")
+                st.error("Could not log check-in to Google Sheets. Please verify the Streamlit secrets and sheet sharing, then try again.")
+                st.stop()
 
         st.session_state["user_checkin"] = user_data
         st.rerun()
@@ -2294,14 +2316,14 @@ def render_variant_slice(output_slice_cif, target_residue, amino_acid_mutation, 
         view = py3Dmol.view(width=PROTEIN_VIEWER_WIDTH, height=PROTEIN_VIEWER_HEIGHT)
         view.addModel(slice_data, "cif")
         view.setStyle({}, {"cartoon": {"color": "#CECECE", "opacity": 0.8}})
-        mutation_selection = {"resi": [target_residue]}
+        mutation_selection = {"resi": [target_residue], "chain": matching_chains}
         view.addStyle(mutation_selection, {"sphere": {"color": "#FF007F", "radius": 3.0}})
         view.addLabel(
             f"Mutation Site: {amino_acid_mutation}\nCarbon Score: {carbon_score}",
             {"fontColor": "white", "backgroundColor": "#111111", "backgroundOpacity": 0.9, "fontSize": 14},
             mutation_selection,
         )
-        view.zoomTo(mutation_selection)
+        view.zoomTo({})
         html = view._make_html()
         if not is_valid_structure_html(html):
             return {"success": False, "reason": "py3Dmol generated empty or oversized viewer HTML", "html": None}
@@ -2735,6 +2757,7 @@ st.title("CarbonVEP")
 st.caption("One-click Streamlit interface for the original CarbonVEP_v4 notebook pipeline.")
 
 uploaded_maf = st.file_uploader("Upload glioma MAF file", type=["maf", "txt", "tsv"])
+reset_display_for_new_upload(uploaded_maf)
 run_clicked = st.button("Start CarbonVEP Analysis", type="primary", disabled=uploaded_maf is None)
 
 if run_clicked and uploaded_maf is not None:
