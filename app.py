@@ -1034,11 +1034,19 @@ def make_skipped_structure_result(message, skipped_details=None):
 
 
 def get_hf_token():
+    secret_names = ("HF_TOKEN", "hf_token", "HUGGINGFACE_TOKEN", "huggingface_token", "HF_HUB_TOKEN", "hf_hub_token")
     try:
-        token = st.secrets.get("HF_TOKEN", "")
+        for secret_name in secret_names:
+            token = st.secrets.get(secret_name, "")
+            if token:
+                return str(token).strip()
     except Exception:
-        token = ""
-    return token or os.environ.get("HF_TOKEN", "")
+        pass
+    for env_name in ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HF_HUB_TOKEN"):
+        token = os.environ.get(env_name, "")
+        if token:
+            return token.strip()
+    return ""
 
 
 def normalize_service_account_info(credentials_info):
